@@ -2,6 +2,8 @@
 
 Copy these patterns into `RALPH.md` and adjust the commands and outputs for the task at hand.
 
+Ralph injects an automatic goal-continuation audit into each iteration. Prefer configs that give the audit concrete evidence: verification commands, required output files, and explicit completion criteria.
+
 ## 1. Fix or test a bug
 
 ```yaml
@@ -145,4 +147,4 @@ Use when you want the loop to run until the iteration budget or a stop request e
 | `optional` | The prompt should remind the agent about the gate, but the loop may stop once the promise is emitted. |
 | `disabled` | You do not want completion-gate checks or reminders at all. |
 
-Keep the prompt body aligned with the frontmatter so the agent knows which stop condition is real.
+Keep the prompt body aligned with the frontmatter so the agent knows which stop condition is real. The automatic goal audit will use these commands, outputs, and completion criteria to decide whether the goal is actually done.

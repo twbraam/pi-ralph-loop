@@ -2,6 +2,8 @@
 
 Use these as starting points when you want the loop to keep working until a concrete deliverable is ready.
 
+Ralph automatically injects a goal-continuation audit into every iteration. The loop agent is asked to avoid repeated work, map the original goal to concrete deliverables, inspect real artifacts/tests/output, and emit the completion promise only when the evidence covers the goal. You do not need to duplicate that audit text in the prompt body; instead, make the body's deliverables and verification commands concrete enough for the audit to evaluate.
+
 ## Self-healing test loop
 
 ```yaml
@@ -121,6 +123,7 @@ Stop with <promise>DONE</promise> only when tests pass, SECURITY_FINDINGS.md exi
 ## Good completion-gate reminders
 
 - Make the gate mode explicit in the prompt body.
+- Name the concrete artifacts, commands, tests, and evidence that the automatic goal audit should check.
 - Use `required` when the loop should not stop until the deliverable exists.
 - Use `optional` when the prompt should remind the agent about the gate without blocking the stop condition.
 - Use `disabled` when the loop should ignore the gate entirely.

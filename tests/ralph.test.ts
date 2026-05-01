@@ -825,6 +825,37 @@ test("renderIterationPrompt includes pacing constraints and reflection checkpoin
   assert.ok(!/\[reflection checkpoint\]/.test(renderIterationPrompt("Body", 3, 8, undefined, { reflectEvery: 4 })));
 });
 
+test("renderIterationPrompt includes Ralph goal continuation audit without a completion promise", () => {
+  const prompt = renderIterationPrompt("Body", 2, 5, undefined, undefined, {
+    elapsedSeconds: 42,
+  });
+
+  assert.match(prompt, /\[goal continuation\]/);
+  assert.match(prompt, /Continue working toward the active Ralph goal\./);
+  assert.match(prompt, /Time spent pursuing goal: 42 seconds/);
+  assert.match(prompt, /Build a prompt-to-artifact checklist/);
+  assert.match(prompt, /Treat uncertainty as not achieved/);
+  assert.match(prompt, /No completion promise is configured/);
+});
+
+test("renderIterationPrompt makes goal continuation promise guidance conditional", () => {
+  const withPromise = renderIterationPrompt("Body", 2, 5, undefined, undefined, {
+    elapsedSeconds: 42,
+    completionPromise: "DONE",
+  });
+  assert.match(withPromise, /Only emit <promise>DONE<\/promise> when the audit shows/);
+
+  const disabledGate = renderIterationPrompt("Body", 2, 5, {
+    completionPromise: "DONE",
+    completionGateMode: "disabled",
+  }, undefined, {
+    elapsedSeconds: 42,
+    completionPromise: "DONE",
+  });
+  assert.match(disabledGate, /Only emit <promise>DONE<\/promise> when the audit shows/);
+  assert.doesNotMatch(disabledGate, /\[completion gate\]/);
+});
+
 test("parseCommandArgs handles explicit path args, leaves task text alone, and rejects task args", () => {
   assert.deepEqual(parseCommandArgs("--path my-task"), { mode: "path", value: "my-task", runtimeArgs: [], error: undefined });
   assert.deepEqual(parseCommandArgs("--path my-task --arg owner=Ada --arg mode=fix"), {

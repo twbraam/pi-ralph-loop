@@ -191,6 +191,10 @@ reflect_every: 4
 
 Commands starting with `./` run from the task directory. Others run from the project root. Blocked commands produce `[blocked by guardrail: PATTERN]`. Timed-out commands produce `[timed out after Ns]`.
 
+### Goal continuation audits
+
+Every Ralph iteration now includes goal-continuation steering: the agent sees elapsed time and a completion-audit checklist. It should map the original prompt to concrete deliverables and inspect real artifacts/tests/status. If `completion_promise` is configured, the agent should emit it only when the evidence covers every requirement; otherwise, it should keep making verified progress until normal loop termination or operator stop.
+
 ## Commands
 
 | Command | What it does |
@@ -201,10 +205,10 @@ Commands starting with `./` run from the task directory. Others run from the pro
 | `/ralph-status [path]` | Show durable status and the latest iteration summary |
 | `/ralph-resume <path>` | Start a new run from an existing `RALPH.md` |
 | `/ralph-archive <path>` | Move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/` |
-| `/ralph-stop [path-or-task]` | Finish current iteration, then stop |
-| `/ralph-cancel [path-or-task]` | Kill the current iteration immediately |
+| `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
+| `/ralph-cancel [task folder or RALPH.md]` | Kill the current iteration immediately |
 | `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter `RALPH.md` template |
-| `/ralph-logs [--path] [--dest]` | Export run artifacts to a directory |
+| `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>]` | Export run artifacts to a directory |
 
 ### Argument passing
 
@@ -214,14 +218,14 @@ Commands starting with `./` run from the task directory. Others run from the pro
 /ralph --path ./my-task --arg owner="Ada" --arg env=staging
 ```
 
-`/ralph-draft`, `/ralph-stop [path-or-task]`, and `/ralph-cancel [path-or-task]` reject `--arg`. Names must match `^\w[\w-]*$` and be declared in `args`.
+`/ralph-draft`, `/ralph-stop [task folder or RALPH.md]`, and `/ralph-cancel [task folder or RALPH.md]` reject `--arg`. Names must match `^\w[\w-]*$` and be declared in `args`.
 
 ### Stopping
 
 | Action | Behavior |
 |---|---|
-| `/ralph-stop [path-or-task]` | Finish current iteration, then stop |
-| `/ralph-cancel [path-or-task]` | Kill the current iteration immediately |
+| `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
+| `/ralph-cancel [task folder or RALPH.md]` | Kill the current iteration immediately |
 | Completion promise + gate | Stop when the promise is matched; only `required` gates also wait for `required_outputs` and OPEN_QUESTIONS.md readiness |
 | Max iterations reached | Stop after the last iteration |
 | No progress for all iterations | Stop with `no-progress-exhaustion` |
@@ -388,7 +392,7 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass
 
 ### Log export
 
-`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, and `transcripts/` to a destination directory. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
+`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, and `transcripts/` to a destination directory. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
 
 ## Termination statuses
 

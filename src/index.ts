@@ -9,6 +9,7 @@ type ToolExecutionEndEvent = Extract<ExtensionEvent, { type: "tool_execution_end
 import {
   buildMissionBrief,
   inspectExistingTarget,
+  hasRuntimeArgToken,
   parseCommandArgs,
   parseRalphMarkdown,
   planTaskDraftTarget,
@@ -151,7 +152,7 @@ function resolveRalphTarget(
     if (inspection.kind === "run") {
       const taskDir = dirname(inspection.ralphPath);
       if (checkCrossProcess) {
-        const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir);
+        const registryTarget = activeRegistryEntries().find((entry) => pathsReferToSameLocation(entry.taskDir, taskDir));
         if (registryTarget) {
           return { kind: "resolved", taskDir: registryTarget.taskDir };
         }
@@ -164,7 +165,7 @@ function resolveRalphTarget(
           statusFile.cwd.length > 0
         ) {
           const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
-            (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+            (entry) => pathsReferToSameLocation(entry.taskDir, taskDir) && entry.loopToken === statusFile.loopToken,
           );
           if (statusRegistryTarget) {
             return { kind: "resolved", taskDir: statusRegistryTarget.taskDir };
@@ -792,6 +793,18 @@ function getLoopIterationKey(loopToken: string, iteration: number): string {
   return `${loopToken}:${iteration}`;
 }
 
+function comparablePath(filePath: string): string {
+  try {
+    return realpathSync.native(filePath);
+  } catch {
+    return resolve(filePath);
+  }
+}
+
+function pathsReferToSameLocation(left: string, right: string): boolean {
+  return comparablePath(left) === comparablePath(right);
+}
+
 function normalizeSnapshotPath(filePath: string): string {
   return filePath.split("\\").join("/");
 }
@@ -981,7 +994,7 @@ function resolveLifecycleTarget(ctx: Pick<CommandContext, "cwd" | "ui">, input: 
 }
 
 function findActiveLifecycleRegistryEntry(ctx: Pick<CommandContext, "cwd">, taskDir: string): ActiveLoopRegistryEntry | undefined {
-  const activeEntry = listActiveLoopRegistryEntries(ctx.cwd).find((entry) => entry.taskDir === taskDir);
+  const activeEntry = listActiveLoopRegistryEntries(ctx.cwd).find((entry) => pathsReferToSameLocation(entry.taskDir, taskDir));
   if (activeEntry) {
     return activeEntry;
   }
@@ -994,7 +1007,7 @@ function findActiveLifecycleRegistryEntry(ctx: Pick<CommandContext, "cwd">, task
     statusFile.cwd.length > 0
   ) {
     return listActiveLoopRegistryEntries(statusFile.cwd).find(
-      (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+      (entry) => pathsReferToSameLocation(entry.taskDir, taskDir) && entry.loopToken === statusFile.loopToken,
     );
   }
 
@@ -1606,13 +1619,18 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const parsed = parseRalphMarkdown(raw);
       const { frontmatter } = parsed;
       if (!validateFrontmatter(frontmatter, ctx)) return;
+      const taskDir = dirname(ralphPath);
+      const activeEntry = findActiveLifecycleRegistryEntry(ctx, taskDir);
+      if (activeEntry) {
+        ctx.ui.notify(`A ralph loop is already active at ${displayPath(ctx.cwd, taskDir)}. Use /ralph-stop or /ralph-cancel first.`, "warning");
+        return;
+      }
       currentStopOnError = frontmatter.stopOnError;
       const runtimeValidationError = validateRuntimeArgs(frontmatter, parsed.body, frontmatter.commands, runtimeArgs);
       if (runtimeValidationError) {
         ctx.ui.notify(runtimeValidationError, "error");
         return;
       }
-      const taskDir = dirname(ralphPath);
       name = basename(taskDir);
       loopState = {
         active: true,
@@ -2075,6 +2093,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   pi.registerCommand("ralph-stop", {
     description: "Stop the ralph loop after the current iteration",
     handler: async (args: string, ctx: CommandContext) => {
+      if (hasRuntimeArgToken(args ?? "")) {
+        ctx.ui.notify("/ralph-stop does not accept --arg. Use a task folder or RALPH.md path only.", "error");
+        return;
+      }
       const parsed = parseCommandArgs(args ?? "");
       if (parsed.error) {
         ctx.ui.notify(parsed.error, "error");
@@ -2114,12 +2136,14 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         }
 
         const taskDir = dirname(inspection.ralphPath);
-        if (sessionTarget && sessionTarget.taskDir === taskDir) {
+        if (sessionTarget && pathsReferToSameLocation(sessionTarget.taskDir, taskDir)) {
           applyStopTarget(pi, ctx, sessionTarget, now, persistedSessionState);
           return;
         }
 
-        const registryTarget = activeRegistryEntries().find((entry) => entry.taskDir === taskDir || entry.ralphPath === inspection.ralphPath);
+        const registryTarget = activeRegistryEntries().find(
+          (entry) => pathsReferToSameLocation(entry.taskDir, taskDir) || pathsReferToSameLocation(entry.ralphPath, inspection.ralphPath),
+        );
         if (registryTarget) {
           applyStopTarget(pi, ctx, materializeRegistryStopTarget(registryTarget), now);
           return;
@@ -2133,7 +2157,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
           statusFile.cwd.length > 0
         ) {
           const statusRegistryTarget = listActiveLoopRegistryEntries(statusFile.cwd).find(
-            (entry) => entry.taskDir === taskDir && entry.loopToken === statusFile.loopToken,
+            (entry) => pathsReferToSameLocation(entry.taskDir, taskDir) && entry.loopToken === statusFile.loopToken,
           );
           if (statusRegistryTarget) {
             applyStopTarget(pi, ctx, materializeRegistryStopTarget(statusRegistryTarget), now);
@@ -2156,7 +2180,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         return;
       }
       if (activeEntries.length > 1) {
-        ctx.ui.notify("Multiple active ralph loops found. Use /ralph-stop --path <task folder or RALPH.md> for an explicit target path.", "error");
+        ctx.ui.notify("Multiple active ralph loops found. Use /ralph-stop <task folder or RALPH.md> for an explicit target path.", "error");
         return;
       }
 
@@ -2167,6 +2191,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   pi.registerCommand("ralph-cancel", {
     description: "Cancel the active ralph iteration immediately",
     handler: async (args: string, ctx: CommandContext) => {
+      if (hasRuntimeArgToken(args ?? "")) {
+        ctx.ui.notify("/ralph-cancel does not accept --arg. Use a task folder or RALPH.md path only.", "error");
+        return;
+      }
       const parsed = parseCommandArgs(args ?? "");
       if (parsed.error) {
         ctx.ui.notify(parsed.error, "error");

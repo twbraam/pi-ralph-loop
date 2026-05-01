@@ -24,7 +24,7 @@ A ralph loop is the right tool when the task is **repetitive, verifiable, or pro
 
 ## Commands
 
-You have ten command names available:
+You have these command forms available:
 
 | Command | Purpose |
 |---|---|
@@ -35,10 +35,10 @@ You have ten command names available:
 | `/ralph-status [path]` | Show durable status and the latest iteration summary |
 | `/ralph-resume <path>` | Start a new run from an existing `RALPH.md` |
 | `/ralph-archive <path>` | Move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/` |
-| `/ralph-stop [path-or-task]` | Graceful stop after current iteration |
-| `/ralph-cancel [path-or-task]` | Kill the current iteration immediately |
+| `/ralph-stop [task folder or RALPH.md]` | Graceful stop after current iteration |
+| `/ralph-cancel [task folder or RALPH.md]` | Kill the current iteration immediately |
 | `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter RALPH.md template |
-| `/ralph-logs [--path] [--dest]` | Export run artifacts |
+| `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>]` | Export run artifacts |
 
 Bundled presets:
 
@@ -164,9 +164,22 @@ Commit with `test: add coverage for <module>`.
 - Do not modify files outside the task scope
 ```
 
-### Completion (always include)
+### Goal continuation audit (automatic)
 
-Use `completion_promise` to define the stop signal. Use `completion_gate` to decide whether required outputs and OPEN_QUESTIONS.md can block stopping:
+The runner now injects a goal-continuation block into every iteration prompt. You do not need to copy this into `RALPH.md`; use it as the default operating model:
+
+- Continue toward the active Ralph goal instead of treating each iteration as a disconnected task.
+- Avoid repeating work that is already done.
+- Before stopping, restate the objective as concrete deliverables or success criteria.
+- Build a prompt-to-artifact checklist that maps explicit requirements, named files, commands, tests, gates, and deliverables to concrete evidence.
+- Inspect real evidence before stopping or, when configured, before emitting the completion promise.
+- Treat uncertainty as incomplete and keep working or gather more evidence.
+
+Write `RALPH.md` prompts so this audit has clear material to check: named deliverables, verification commands, required outputs, and explicit stop criteria when early stopping is knowable.
+
+### Completion (include when early stopping is knowable)
+
+Use `completion_promise` to define an early stop signal. Use `completion_gate` to decide whether required outputs and OPEN_QUESTIONS.md can block stopping:
 
 - `required` — the default when `completion_promise` is set; the loop stops only when the promise, required outputs, and OPEN_QUESTIONS.md are all ready
 - `optional` — the prompt still reminds the agent about outputs and OPEN_QUESTIONS.md, but `complete` can happen once the promise is emitted
@@ -246,8 +259,8 @@ You can omit `shell_policy` entirely unless you need an allowlist.
 
 | Action | Behavior |
 |---|---|
-| `/ralph-stop [path-or-task]` | Finish current iteration, then stop |
-| `/ralph-cancel [path-or-task]` | Kill current iteration immediately |
+| `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
+| `/ralph-cancel [task folder or RALPH.md]` | Kill current iteration immediately |
 | Completion promise + gate | Stop when the promise is matched; `required` gates also require `required_outputs` and OPEN_QUESTIONS.md |
 | `max_iterations` reached | Stop after N iterations |
 | No progress in every iteration | Stop with `no-progress-exhaustion` |
@@ -270,7 +283,7 @@ The agent should write progress to this file at the end of each iteration.
 | Mistake | Fix |
 |---|---|
 | Vague task ("improve the codebase") | Be specific: "fix the 3 failing tests in auth.test.ts" |
-| No completion criteria | Set `completion_promise` and `required_outputs` |
+| No completion criteria for a knowable done state | Set `completion_promise` and `required_outputs` so the automatic goal audit has concrete evidence to verify |
 | No evidence commands | Add commands that show current state |
 | Too many tasks per iteration | One task per iteration works best |
 | Missing guardrails on production code | Block `git push` and protect secrets |

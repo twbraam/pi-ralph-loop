@@ -361,7 +361,6 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
   ) {
     return "Invalid RALPH frontmatter: timeout must be a YAML number";
   }
-
   return null;
 }
 
@@ -883,8 +882,8 @@ export function findShellPolicyBlockedCommandPattern(command: string, shellPolic
   return findAllowedCommandPattern(command, shellPolicy.allow) ? undefined : "shell_policy.allowlist";
 }
 
-function hasRuntimeArgToken(text: string): boolean {
-  return /(?:^|\s)--arg(?:\s|=)/.test(text);
+export function hasRuntimeArgToken(text: string): boolean {
+  return /(?:^|\s)--arg(?:\s|=|$)/.test(text);
 }
 
 function parseRuntimeArgEntry(token: string): { entry?: RuntimeArg; error?: string } {
@@ -1634,12 +1633,18 @@ export function renderRalphBody(
   return resolvePlaceholders(body, outputs, ralph, runtimeArgs).replace(/<!--[\s\S]*?-->/g, "");
 }
 
+export type GoalRuntimeContext = {
+  elapsedSeconds: number;
+  completionPromise?: string;
+};
+
 export function renderIterationPrompt(
   body: string,
   iteration: number,
   maxIterations: number,
   completionGate?: { completionPromise?: string; requiredOutputs?: string[]; completionGateMode?: CompletionGateMode; failureReasons?: string[]; rejectionReasons?: string[] },
   pacing?: { itemsPerIteration?: number; reflectEvery?: number },
+  runtime?: GoalRuntimeContext,
 ): string {
   const extraBlocks: string[] = [];
 
@@ -1652,6 +1657,30 @@ export function renderIterationPrompt(
   }
   if (pacingLines.length > 0) {
     extraBlocks.push(pacingLines.join("\n"));
+  }
+
+  if (runtime) {
+    const completionPromise = runtime.completionPromise?.trim();
+    extraBlocks.push([
+      "[goal continuation]",
+      "Continue working toward the active Ralph goal.",
+      "",
+      `Time spent pursuing goal: ${runtime.elapsedSeconds} seconds`,
+      "",
+      "Avoid repeating work that is already done. Choose the next concrete action toward the objective.",
+      "",
+      "Before deciding that the goal is achieved, perform a completion audit against the actual current state:",
+      "- Restate the objective as concrete deliverables or success criteria.",
+      "- Build a prompt-to-artifact checklist that maps every explicit requirement, named file, command, test, gate, and deliverable to concrete evidence.",
+      "- Inspect the relevant files, command output, test results, or other real evidence for each checklist item.",
+      "- Do not accept proxy signals as completion by themselves. Passing tests or substantial implementation effort are useful evidence only if they cover every requirement.",
+      "- Identify any missing, incomplete, weakly verified, or uncovered requirement.",
+      "- Treat uncertainty as not achieved; do more verification or continue the work.",
+      "",
+      completionPromise
+        ? `Only emit <promise>${completionPromise}</promise> when the audit shows that the goal has actually been achieved and no required work remains.`
+        : "No completion promise is configured for this loop. Do not invent one; continue making verified progress until the normal loop stop condition or operator stop applies.",
+    ].join("\n"));
   }
 
   if (completionGate) {

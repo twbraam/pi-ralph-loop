@@ -81,7 +81,7 @@ If `RALPH_PROGRESS.md` is listed in `required_outputs`, it is ignored and does n
 
 Use `optional` when you want the prompt to remind the agent about outputs and `OPEN_QUESTIONS.md`, but you still want the loop to stop on the promise alone. Use `disabled` when you want to suppress the gate reminders and checks entirely.
 
-If you add a gate, include a short body section that names the stop condition explicitly:
+Ralph automatically injects a goal-continuation audit into each iteration, but that audit does not create an early-stop contract by itself. If you add a gate, include a short body section that names the stop condition explicitly so the audit can map the goal to concrete evidence:
 
 ```markdown
 ## Completion
@@ -93,7 +93,7 @@ Stop with <promise>DONE</promise> when ARCHITECTURE.md exists and OPEN_QUESTIONS
 
 ### What `/ralph-draft` emits today
 
-The generated body is compact. It does **not** include the richer Orientation / Evidence / Rules / Completion scaffold below unless you add that manually.
+The generated body is compact. It does **not** include the richer Orientation / Evidence / Rules / Completion scaffold below unless you add that manually. It also does not need to duplicate Ralph's automatic goal-continuation audit; the runner injects that audit during execution.
 
 #### Analysis mode
 
@@ -156,6 +156,7 @@ Notes:
 - `git-log` is rendered as `Recent git history`; every other command is rendered as `Latest <command> output`.
 - If the generator falls back to `repo-map`, the label is `Latest repo-map output:`.
 - The current body does not add separate evidence, rules, or completion sections automatically.
+- The runtime adds the goal-continuation audit automatically, so drafts should focus on concrete task context, commands, deliverables, and stop criteria when early stopping is knowable.
 
 ### Manual enhancement guidance, not generator output
 

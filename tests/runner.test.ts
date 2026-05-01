@@ -340,6 +340,46 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRalphLoop injects goal continuation audit into every iteration prompt", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+
+    const promptPath = join(taskDir, "prompt.json");
+    const scriptPath = join(taskDir, "mock-pi-goal-continuation.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+printf '%s' "$line" > "${promptPath}"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    const prompt = JSON.parse(readFileSync(promptPath, "utf8")) as { message: string };
+    assert.match(prompt.message, /\[goal continuation\]/);
+    assert.match(prompt.message, /Time spent pursuing goal: \d+ seconds/);
+    assert.match(prompt.message, /Build a prompt-to-artifact checklist/);
+    assert.match(prompt.message, /No completion promise is configured/);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop ignores missing RALPH_PROGRESS.md", async () => {
   const taskDir = createTempDir();
   try {

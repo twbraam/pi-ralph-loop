@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import registerRalphCommands from "../src/index.ts";
-import { appendIterationRecord, listActiveLoopRegistryEntries, writeActiveLoopRegistryEntry, writeStatusFile } from "../src/runner-state.ts";
+import { appendIterationRecord, checkCancelSignal, checkStopSignal, listActiveLoopRegistryEntries, writeActiveLoopRegistryEntry, writeStatusFile } from "../src/runner-state.ts";
 
 function createTempDir(): string {
   return mkdtempSync(join(tmpdir(), "pi-ralph-loop-lifecycle-"));
@@ -89,6 +89,29 @@ async function invoke(harness: ReturnType<typeof createHarness>, name: string, a
   assert.ok(handler, `missing handler for ${name}`);
   return await handler(args, harness.ctx(cwd));
 }
+
+test("/ralph-stop and /ralph-cancel reject runtime args", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const stopHarness = createHarness();
+  await invoke(stopHarness, "ralph-stop", "--path ./task --arg owner=Ada", cwd);
+  await invoke(stopHarness, "ralph-stop", "--arg owner=Ada", cwd);
+  assert.equal(stopHarness.notifications.length, 2);
+  assert.equal(stopHarness.notifications[0].level, "error");
+  assert.equal(stopHarness.notifications[1].level, "error");
+  assert.match(stopHarness.notifications[0].message, /does not accept --arg/);
+  assert.match(stopHarness.notifications[1].message, /does not accept --arg/);
+
+  const cancelHarness = createHarness();
+  await invoke(cancelHarness, "ralph-cancel", "--path ./task --arg owner=Ada", cwd);
+  await invoke(cancelHarness, "ralph-cancel", "--arg owner=Ada", cwd);
+  assert.equal(cancelHarness.notifications.length, 2);
+  assert.equal(cancelHarness.notifications[0].level, "error");
+  assert.equal(cancelHarness.notifications[1].level, "error");
+  assert.match(cancelHarness.notifications[0].message, /does not accept --arg/);
+  assert.match(cancelHarness.notifications[1].message, /does not accept --arg/);
+});
 
 test("/ralph-list shows active loops from the durable registry", async (t) => {
   const cwd = createTempDir();
@@ -282,6 +305,216 @@ test("/ralph-archive rejects a symlinked archive root outside the task directory
   assert.equal(harness.notifications.length, 1);
   assert.equal(harness.notifications[0].level, "error");
   assert.match(harness.notifications[0].message, /archive root.*symlink|outside the task directory|unsafe/i);
+});
+
+test("/ralph --path refuses active loops through symlinked task paths", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const realTaskDir = join(cwd, "real-task");
+  const linkTaskDir = join(cwd, "link-task");
+  mkdirSync(realTaskDir, { recursive: true });
+  symlinkSync(realTaskDir, linkTaskDir, "dir");
+  const ralphPath = join(realTaskDir, "RALPH.md");
+  const now = new Date().toISOString();
+  writeFileSync(ralphPath, createValidRalphMarkdown(), "utf8");
+  writeStatusFile(realTaskDir, {
+    loopToken: "token-symlink",
+    ralphPath,
+    taskDir: realTaskDir,
+    cwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 1,
+    startedAt: now,
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir: realTaskDir,
+    ralphPath,
+    cwd,
+    loopToken: "token-symlink",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    startedAt: now,
+    updatedAt: now,
+  });
+
+  const capturedCalls: Array<any> = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (...args: Array<any>) => {
+      capturedCalls.push(args[0]);
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+
+  await invoke(harness, "ralph", `--path ${linkTaskDir}`, cwd);
+
+  assert.equal(capturedCalls.length, 0);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].level, "warning");
+  assert.match(harness.notifications[0].message, /Use \/ralph-stop or \/ralph-cancel first\./);
+});
+
+test("/ralph-stop and /ralph-cancel resolve active loops through symlinked task paths", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const realTaskDir = join(cwd, "real-stop-task");
+  const linkTaskDir = join(cwd, "link-stop-task");
+  mkdirSync(realTaskDir, { recursive: true });
+  symlinkSync(realTaskDir, linkTaskDir, "dir");
+  const ralphPath = join(realTaskDir, "RALPH.md");
+  const now = new Date().toISOString();
+  writeFileSync(ralphPath, createValidRalphMarkdown(), "utf8");
+  writeStatusFile(realTaskDir, {
+    loopToken: "token-symlink-stop",
+    ralphPath,
+    taskDir: realTaskDir,
+    cwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 1,
+    startedAt: now,
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir: realTaskDir,
+    ralphPath,
+    cwd,
+    loopToken: "token-symlink-stop",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    startedAt: now,
+    updatedAt: now,
+  });
+
+  const harness = createHarness();
+  await invoke(harness, "ralph-stop", linkTaskDir, cwd);
+  await invoke(harness, "ralph-cancel", linkTaskDir, cwd);
+
+  assert.equal(checkStopSignal(realTaskDir), true);
+  assert.equal(checkCancelSignal(realTaskDir), true);
+  assert.equal(harness.notifications.length, 2);
+  assert.equal(harness.notifications[0].level, "info");
+  assert.equal(harness.notifications[1].level, "warning");
+});
+
+test("/ralph --path refuses active loops before validating required runtime args", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "active-args-task");
+  mkdirSync(taskDir, { recursive: true });
+  const ralphPath = join(taskDir, "RALPH.md");
+  const now = new Date().toISOString();
+  writeFileSync(ralphPath, [
+    "---",
+    "args:",
+    "  - owner",
+    "commands: []",
+    "max_iterations: 3",
+    "timeout: 1",
+    "guardrails:",
+    "  block_commands: []",
+    "  protected_files: []",
+    "---",
+    "Run the task for {{ args.owner }}.",
+  ].join("\n"), "utf8");
+  writeStatusFile(taskDir, {
+    loopToken: "token-active-args",
+    ralphPath,
+    taskDir,
+    cwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 1,
+    startedAt: now,
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  writeActiveLoopRegistryEntry(cwd, {
+    taskDir,
+    ralphPath,
+    cwd,
+    loopToken: "token-active-args",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    startedAt: now,
+    updatedAt: now,
+  });
+
+  const capturedCalls: Array<any> = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (...args: Array<any>) => {
+      capturedCalls.push(args[0]);
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+
+  await invoke(harness, "ralph", `--path ${taskDir}`, cwd);
+
+  assert.equal(capturedCalls.length, 0);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].level, "warning");
+  assert.match(harness.notifications[0].message, /Use \/ralph-stop or \/ralph-cancel first\./);
+  assert.doesNotMatch(harness.notifications[0].message, /Missing required arg/);
+});
+
+test("/ralph --path refuses active loops discovered through status.cwd from another cwd", async (t) => {
+  const originCwd = createTempDir();
+  const invocationCwd = createTempDir();
+  t.after(() => rmSync(originCwd, { recursive: true, force: true }));
+  t.after(() => rmSync(invocationCwd, { recursive: true, force: true }));
+
+  const taskDir = join(originCwd, "active-path-task");
+  mkdirSync(taskDir, { recursive: true });
+  const ralphPath = join(taskDir, "RALPH.md");
+  const now = new Date().toISOString();
+  writeFileSync(ralphPath, createValidRalphMarkdown(), "utf8");
+  writeStatusFile(taskDir, {
+    loopToken: "token-active-path",
+    ralphPath,
+    taskDir,
+    cwd: originCwd,
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    timeout: 1,
+    startedAt: now,
+    guardrails: { blockCommands: [], protectedFiles: [] },
+  });
+  writeActiveLoopRegistryEntry(originCwd, {
+    taskDir,
+    ralphPath,
+    cwd: originCwd,
+    loopToken: "token-active-path",
+    status: "running",
+    currentIteration: 1,
+    maxIterations: 5,
+    startedAt: now,
+    updatedAt: now,
+  });
+
+  const capturedCalls: Array<any> = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (...args: Array<any>) => {
+      capturedCalls.push(args[0]);
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+
+  await invoke(harness, "ralph", `--path ${taskDir}`, invocationCwd);
+
+  assert.equal(capturedCalls.length, 0);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].level, "warning");
+  assert.match(harness.notifications[0].message, /Use \/ralph-stop or \/ralph-cancel first\./);
 });
 
 test("/ralph-resume and /ralph-archive refuse active loops discovered through status.cwd from another cwd", async (t) => {

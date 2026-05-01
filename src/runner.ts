@@ -602,6 +602,10 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           itemsPerIteration: fm.itemsPerIteration,
           reflectEvery: fm.reflectEvery,
         },
+        {
+          elapsedSeconds: Math.round((Date.now() - startMs) / 1000),
+          completionPromise: currentCompletionPromise,
+        },
       );
       const writeIterationTranscriptSafe = (record: IterationRecord, assistantText?: string, note?: string) => {
         try {
