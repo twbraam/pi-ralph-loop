@@ -722,6 +722,112 @@ fi
   }
 });
 
+test("runRalphLoop accepts an already-complete optional completion promise without forcing new durable progress", async () => {
+  const taskDir = createTempDir();
+  let captureDir: string | undefined;
+  try {
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({ max_iterations: 2, completion_promise: "DONE", completion_gate: "optional" }),
+    );
+    captureDir = mkdtempSync(join(tmpdir(), "pi-ralph-loop-complete-"));
+    const promptCounterPath = join(captureDir, "prompt-counter.txt");
+    const scriptPath = join(taskDir, "mock-pi-complete.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+count=0
+if [ -f "${promptCounterPath}" ]; then
+  count=$(cat "${promptCounterPath}")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "${promptCounterPath}"
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Completion audit passed. <promise>DONE</promise>"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const notifications: Array<{ message: string; level: string }> = [];
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 2,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      onNotify(message, level) {
+        notifications.push({ message, level });
+      },
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].progress, false);
+    assert.equal(result.iterations[0].completionPromiseMatched, true);
+    assert.equal(result.iterations[0].completion?.durableProgressObserved, false);
+    assert.equal(readFileSync(promptCounterPath, "utf8"), "1");
+    assert.ok(
+      notifications.some(({ message }) =>
+        message.includes("Completion promise matched on iteration 1") && message.includes("without new durable progress"),
+      ),
+    );
+  } finally {
+    if (captureDir) {
+      rmSync(captureDir, { recursive: true, force: true });
+    }
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop accepts an already-complete required completion promise when the gate is ready", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nAll clear.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({ max_iterations: 2, completion_promise: "DONE", required_outputs: ["ARCHITECTURE.md"] }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi-complete-required.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Completion audit passed. <promise>DONE</promise>"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 2,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.equal(result.iterations.length, 1);
+    assert.equal(result.iterations[0].progress, false);
+    assert.deepEqual(result.iterations[0].completionGate, { ready: true, reasons: [] });
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("validateCompletionReadiness reports ready when required outputs exist and OPEN_QUESTIONS.md is clear", (t) => {
   const taskDir = createTempDir();
   t.after(() => rmSync(taskDir, { recursive: true, force: true }));

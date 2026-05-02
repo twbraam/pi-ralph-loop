@@ -850,7 +850,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }
 
       let completionGate: CompletionReadiness | undefined;
-      if (completionPromiseMatched && progress !== false && currentCompletionGateMode !== "disabled") {
+      if (completionPromiseMatched && currentCompletionGateMode !== "disabled") {
         completionGate = validateCompletionReadiness(taskDir, currentRequiredOutputs);
         if (completionRecord) {
           completionRecord.gateChecked = true;
@@ -952,21 +952,31 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
       // Check completion promise
       if (completionPromiseMatched) {
-        if (progress === false) {
-          completionGateRejectionReasons = ["durable progress (no durable file changes were observed)"];
+        const requiredCompletionGateBlocked = currentCompletionGateMode === "required" && completionGate !== undefined && !completionGate.ready;
+        if (progress === false && requiredCompletionGateBlocked) {
+          completionGateRejectionReasons = [
+            "durable progress (no durable file changes were observed)",
+            ...(completionGate?.reasons ?? []),
+          ];
           onNotify?.(
-            `Completion promise matched on iteration ${i}, but no durable progress was detected. Continuing.`,
+            `Completion promise matched on iteration ${i}, but no durable progress was detected and the completion gate failed. Continuing.`,
             "warning",
           );
-        } else if (currentCompletionGateMode === "required" && completionGate && !completionGate.ready) {
+        } else if (requiredCompletionGateBlocked) {
           onNotify?.(
             `completion promise matched on iteration ${i}, but the completion gate failed. Continuing.`,
             "warning",
           );
         } else {
+          completionGateRejectionReasons = [];
           if (progress === "unknown") {
             onNotify?.(
               `Completion promise matched on iteration ${i}, and durable progress could not be verified. Stopping.`,
+              "info",
+            );
+          } else if (progress === false) {
+            onNotify?.(
+              `Completion promise matched on iteration ${i} without new durable progress; current completion criteria allow stopping.`,
               "info",
             );
           } else {
