@@ -154,6 +154,56 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
   assert.equal(parsed.body, "Body\n");
 });
 
+test("parseRalphMarkdown accepts common camelCase frontmatter aliases without silently falling back to defaults", () => {
+  const parsed = parseRalphMarkdown(
+    "---\ncommands:\n  - name: rebuild\n    run: docker compose up --build\n    timeout: 1800\nmaxIterations: 4\ninterIterationDelay: 2\nitemsPerIteration: 3\nreflectEvery: 4\ntimeout: 1800\ncompletionPromise: DONE\ncompletionGate: optional\nrequiredOutputs:\n  - RESULTS.md\nstopOnError: false\nguardrails:\n  blockCommands:\n    - git\\s+push\n  protectedFiles:\n    - .env*\n---\nBody\n",
+  );
+
+  assert.deepEqual(parsed.frontmatter, {
+    commands: [{ name: "rebuild", run: "docker compose up --build", timeout: 1800 }],
+    maxIterations: 4,
+    interIterationDelay: 2,
+    itemsPerIteration: 3,
+    reflectEvery: 4,
+    timeout: 1800,
+    completionPromise: "DONE",
+    completionGate: "optional",
+    requiredOutputs: ["RESULTS.md"],
+    stopOnError: false,
+    guardrails: { blockCommands: ["git\\s+push"], protectedFiles: [".env*"] },
+    invalidCommandEntries: undefined,
+  });
+  assert.equal(validateFrontmatter(parsed.frontmatter), null);
+});
+
+test("inspectDraftContent validates camelCase aliases instead of ignoring invalid values", () => {
+  const inspection = inspectDraftContent(
+    "---\ncommands: []\nmaxIterations: 0\ntimeout: 60\nguardrails:\n  blockCommands: []\n  protectedFiles: []\n---\nBody\n",
+  );
+
+  assert.equal(inspection.error, "Invalid max_iterations: must be between 1 and 50");
+});
+
+test("inspectDraftContent validates stopOnError aliases as booleans", () => {
+  const inspection = inspectDraftContent(
+    "---\ncommands: []\nmax_iterations: 1\ntimeout: 60\nstopOnError: \"false\"\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
+  );
+
+  assert.equal(inspection.error, "Invalid RALPH frontmatter: stop_on_error must be a YAML boolean");
+});
+
+test("parseRalphMarkdown gives snake_case keys precedence over camelCase aliases", () => {
+  const parsed = parseRalphMarkdown(
+    "---\ncommands: []\nmax_iterations: 3\nmaxIterations: nope\ntimeout: 60\ncompletion_gate: required\ncompletionGate: optional\nguardrails:\n  block_commands: []\n  blockCommands: nope\n  protected_files: []\n  protectedFiles: nope\n---\nBody\n",
+  );
+
+  assert.equal(parsed.frontmatter.maxIterations, 3);
+  assert.equal(parsed.frontmatter.completionGate, "required");
+  assert.deepEqual(parsed.frontmatter.guardrails.blockCommands, []);
+  assert.deepEqual(parsed.frontmatter.guardrails.protectedFiles, []);
+  assert.equal(validateFrontmatter(parsed.frontmatter), null);
+});
+
 test("parseRalphMarkdown parses declared args as runtime parameters", () => {
   const parsed = parseRalphMarkdown(
     "---\nargs:\n  - owner\n  - mode\ncommands: []\nmax_iterations: 1\ntimeout: 1\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
@@ -241,12 +291,20 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
     "Invalid reflect_every: must be an integer between 2 and 20",
   );
   assert.equal(
-    validateFrontmatter({ ...defaultFrontmatter(), timeout: 0 }),
-    "Invalid timeout: must be greater than 0 and at most 300",
+    validateFrontmatter({
+      ...defaultFrontmatter(),
+      timeout: 1800,
+      commands: [{ name: "rebuild", run: "docker compose up --build", timeout: 1800 }],
+    }),
+    null,
   );
   assert.equal(
-    validateFrontmatter({ ...defaultFrontmatter(), timeout: 301 }),
-    "Invalid timeout: must be greater than 0 and at most 300",
+    validateFrontmatter({ ...defaultFrontmatter(), timeout: 0 }),
+    "Invalid timeout: must be greater than 0 and at most 3600",
+  );
+  assert.equal(
+    validateFrontmatter({ ...defaultFrontmatter(), timeout: 3601 }),
+    "Invalid timeout: must be greater than 0 and at most 3600",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), guardrails: { blockCommands: ["["], protectedFiles: [] } }),
@@ -290,11 +348,11 @@ test("validateFrontmatter accepts valid input and rejects invalid bounds, names,
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build", run: "echo ok", timeout: 0 }] }),
-    "Invalid command build: timeout must be greater than 0 and at most 300",
+    "Invalid command build: timeout must be greater than 0 and at most 3600",
   );
   assert.equal(
-    validateFrontmatter({ ...defaultFrontmatter(), commands: [{ name: "build", run: "echo ok", timeout: 301 }] }),
-    "Invalid command build: timeout must be greater than 0 and at most 300",
+    validateFrontmatter({ ...defaultFrontmatter(), timeout: 3600, commands: [{ name: "build", run: "echo ok", timeout: 3601 }] }),
+    "Invalid command build: timeout must be greater than 0 and at most 3600",
   );
   assert.equal(
     validateFrontmatter({ ...defaultFrontmatter(), timeout: 20, commands: [{ name: "build", run: "echo ok", timeout: 21 }] }),
@@ -1869,7 +1927,7 @@ test("acceptStrengthenedDraft rejects placeholder drift, increased limits, and c
           "    run: npm test",
           "    timeout: 20",
           "max_iterations: 20",
-          "timeout: 301",
+          "timeout: 3601",
           "guardrails:",
           "  block_commands:",
           "    - 'git\\s+push'",
@@ -2062,6 +2120,17 @@ test("acceptStrengthenedDraft accepts unchanged completion_promise and rejects n
     assert.fail("expected unchanged completion_promise to be accepted");
   }
   assert.equal(parseRalphMarkdown(accepted.content).frontmatter.completionPromise, "ship-it");
+
+  const camelPromisedRequest = {
+    ...promisedRequest,
+    baselineDraft: promisedRequest.baselineDraft.replace("completion_promise: ship-it", "completionPromise: ship-it"),
+  };
+  const camelPromisedDraft = promisedDraft.replace("completion_promise: ship-it", "completionPromise: ship-it");
+  const camelAccepted = acceptStrengthenedDraft(camelPromisedRequest, camelPromisedDraft);
+  if (!camelAccepted) {
+    assert.fail("expected unchanged completionPromise alias to be accepted");
+  }
+  assert.equal(parseRalphMarkdown(camelAccepted.content).frontmatter.completionPromise, "ship-it");
 
   assert.equal(
     acceptStrengthenedDraft(

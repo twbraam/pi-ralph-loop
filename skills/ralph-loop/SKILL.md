@@ -1,11 +1,20 @@
 ---
 name: ralph-loop
-description: Use when starting or configuring an autonomous coding loop with pi-ralph-loop. Triggered by phrases like autonomous loop, repeat until done, keep running tests until green, or a long-running coding campaign. Covers when to loop, how to write RALPH.md, guardrails, completion gating, and iteration prompt patterns.
+description: Use when starting, invoking, debugging, or configuring pi-ralph-loop, /ralph, /ralph-draft, RALPH.md, or autonomous coding loops. Trigger on phrases like ralph, Ralph loop, pi-ralph-loop, autonomous loop, repeat until done, keep running tests until green, or long-running coding campaign. Covers native Pi slash-command usage, RALPH.md authoring, guardrails, completion gating, and iteration prompt patterns.
 ---
 
 # Ralph Loop Skill
 
 You know how to code. This skill teaches you when and how to run autonomous loops with pi-ralph-loop.
+
+## Native Pi command rules
+
+- `/ralph` is a Pi slash command, not a shell executable. Never run `/ralph ...` directly through `bash`.
+- If the user intended a bare `/ralph ...` command but it reaches you as an ordinary chat message, Pi did not intercept the command. Do not manually simulate the loop. Tell the user the extension is not loaded/reloaded and ask them to run the slash command again after `pi install npm:@lnilluv/pi-ralph-loop` and `/reload` or a Pi restart.
+- `pi --help` does not list extension slash commands. Use `pi list` to check that `npm:@lnilluv/pi-ralph-loop` is installed.
+- If you are preparing a loop for the user, create or edit the task folder and `RALPH.md`, then tell the user to run `/ralph --path ./task`.
+- For explicit noninteractive smoke tests, run Pi itself with the slash command as the prompt, for example `pi -p "/ralph --path ./task"`. Do not confuse that with running `/ralph` in bash.
+- `RALPH.md` YAML uses `snake_case` keys. Common camelCase aliases are accepted for compatibility, but new files should use `max_iterations`, `inter_iteration_delay`, `completion_promise`, `completion_gate`, `required_outputs`, `stop_on_error`, `guardrails.block_commands`, and `guardrails.protected_files`.
 
 ## When to loop
 
@@ -64,13 +73,13 @@ my-task/
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–300s, default 60) |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`) |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
 | `items_per_iteration` | integer | — | Pacing cap for each iteration. Valid values: 1–20 |
 | `reflect_every` | integer | — | Reflection cadence. Valid values: 2–20 |
-| `timeout` | integer | `300` | Seconds per iteration |
+| `timeout` | integer | `300` | Seconds per iteration. Valid values: 1–3600 |
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
 | `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether required outputs and OPEN_QUESTIONS.md block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for completion |

@@ -121,6 +121,7 @@ function isRecord(value: unknown): value is UnknownRecord {
 
 const draftModes: DraftMode[] = ["analysis", "fix", "migration", "general"];
 const draftSources: DraftSource[] = ["deterministic", "llm-strengthened", "fallback"];
+const MAX_TIMEOUT_SECONDS = 3600;
 
 function isDraftMode(value: unknown): value is DraftMode {
   return typeof value === "string" && draftModes.includes(value as DraftMode);
@@ -172,6 +173,18 @@ function parseOptionalNumber(value: unknown): number | undefined {
   return Number(value);
 }
 
+function hasOwn(record: UnknownRecord, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function readAliasedValue(record: UnknownRecord, snakeCaseKey: string, camelCaseKey: string): unknown {
+  return hasOwn(record, snakeCaseKey) ? record[snakeCaseKey] : record[camelCaseKey];
+}
+
+function hasAliasedValue(record: UnknownRecord, snakeCaseKey: string, camelCaseKey: string): boolean {
+  return hasOwn(record, snakeCaseKey) || hasOwn(record, camelCaseKey);
+}
+
 function isUniversalProtectedGlob(pattern: string): boolean {
   const trimmed = pattern.trim().replace(/\/+$/, "");
   if (!trimmed) return true;
@@ -189,7 +202,7 @@ function matchRalphMarkdown(raw: string): RegExpMatchArray | null {
 
 
 function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | null {
-  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "guardrails")) {
+  if (!hasOwn(rawFrontmatter, "guardrails")) {
     return null;
   }
 
@@ -197,27 +210,23 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
   if (!isRecord(guardrails)) {
     return "Invalid RALPH frontmatter: guardrails must be a YAML mapping";
   }
-  if (
-    Object.prototype.hasOwnProperty.call(guardrails, "block_commands") &&
-    !Array.isArray(guardrails.block_commands)
-  ) {
+  const blockCommands = readAliasedValue(guardrails, "block_commands", "blockCommands");
+  if (blockCommands !== undefined && !Array.isArray(blockCommands)) {
     return "Invalid RALPH frontmatter: guardrails.block_commands must be a YAML sequence";
   }
-  if (
-    Object.prototype.hasOwnProperty.call(guardrails, "protected_files") &&
-    !Array.isArray(guardrails.protected_files)
-  ) {
+  const protectedFiles = readAliasedValue(guardrails, "protected_files", "protectedFiles");
+  if (protectedFiles !== undefined && !Array.isArray(protectedFiles)) {
     return "Invalid RALPH frontmatter: guardrails.protected_files must be a YAML sequence";
   }
-  if (Object.prototype.hasOwnProperty.call(guardrails, "shell_policy")) {
-    const shellPolicy = guardrails.shell_policy;
+  if (hasAliasedValue(guardrails, "shell_policy", "shellPolicy")) {
+    const shellPolicy = readAliasedValue(guardrails, "shell_policy", "shellPolicy");
     if (!isRecord(shellPolicy)) {
       return "Invalid RALPH frontmatter: guardrails.shell_policy must be a YAML mapping";
     }
-    if (Object.prototype.hasOwnProperty.call(shellPolicy, "mode") && typeof shellPolicy.mode !== "string") {
+    if (hasOwn(shellPolicy, "mode") && typeof shellPolicy.mode !== "string") {
       return "Invalid RALPH frontmatter: guardrails.shell_policy.mode must be a YAML string";
     }
-    if (Object.prototype.hasOwnProperty.call(shellPolicy, "allow") && !Array.isArray(shellPolicy.allow)) {
+    if (hasOwn(shellPolicy, "allow") && !Array.isArray(shellPolicy.allow)) {
       return "Invalid RALPH frontmatter: guardrails.shell_policy.allow must be a YAML sequence";
     }
     if (Array.isArray(shellPolicy.allow)) {
@@ -235,11 +244,11 @@ function validateRawGuardrailsShape(rawFrontmatter: UnknownRecord): string | nul
 }
 
 function validateRawCompletionGateShape(rawFrontmatter: UnknownRecord): string | null {
-  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "completion_gate")) {
+  if (!hasAliasedValue(rawFrontmatter, "completion_gate", "completionGate")) {
     return null;
   }
 
-  const completionGate = rawFrontmatter.completion_gate;
+  const completionGate = readAliasedValue(rawFrontmatter, "completion_gate", "completionGate");
   if (typeof completionGate !== "string") {
     return "Invalid RALPH frontmatter: completion_gate must be a YAML string";
   }
@@ -247,11 +256,11 @@ function validateRawCompletionGateShape(rawFrontmatter: UnknownRecord): string |
 }
 
 function validateRawRequiredOutputsShape(rawFrontmatter: UnknownRecord): string | null {
-  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "required_outputs")) {
+  if (!hasAliasedValue(rawFrontmatter, "required_outputs", "requiredOutputs")) {
     return null;
   }
 
-  const requiredOutputs = rawFrontmatter.required_outputs;
+  const requiredOutputs = readAliasedValue(rawFrontmatter, "required_outputs", "requiredOutputs");
   if (!Array.isArray(requiredOutputs)) {
     return "Invalid RALPH frontmatter: required_outputs must be a YAML sequence";
   }
@@ -264,7 +273,7 @@ function validateRawRequiredOutputsShape(rawFrontmatter: UnknownRecord): string 
 }
 
 function validateRawArgsShape(rawFrontmatter: UnknownRecord): string | null {
-  if (!Object.prototype.hasOwnProperty.call(rawFrontmatter, "args")) {
+  if (!hasOwn(rawFrontmatter, "args")) {
     return null;
   }
 
@@ -280,24 +289,34 @@ function validateRawArgsShape(rawFrontmatter: UnknownRecord): string | null {
   return null;
 }
 
+function validateRawStopOnErrorShape(rawFrontmatter: UnknownRecord): string | null {
+  if (!hasAliasedValue(rawFrontmatter, "stop_on_error", "stopOnError")) {
+    return null;
+  }
+  if (typeof readAliasedValue(rawFrontmatter, "stop_on_error", "stopOnError") !== "boolean") {
+    return "Invalid RALPH frontmatter: stop_on_error must be a YAML boolean";
+  }
+  return null;
+}
+
 function validateRawCommandEntryShape(command: unknown, index: number): string | null {
   if (!isRecord(command)) {
     return `Invalid RALPH frontmatter: commands[${index}] must be a YAML mapping`;
   }
-  if (Object.prototype.hasOwnProperty.call(command, "name") && typeof command.name !== "string") {
+  if (hasOwn(command, "name") && typeof command.name !== "string") {
     return `Invalid RALPH frontmatter: commands[${index}].name must be a YAML string`;
   }
-  if (Object.prototype.hasOwnProperty.call(command, "run") && typeof command.run !== "string") {
+  if (hasOwn(command, "run") && typeof command.run !== "string") {
     return `Invalid RALPH frontmatter: commands[${index}].run must be a YAML string`;
   }
-  if (Object.prototype.hasOwnProperty.call(command, "timeout") && typeof command.timeout !== "number") {
+  if (hasOwn(command, "timeout") && typeof command.timeout !== "number") {
     return `Invalid RALPH frontmatter: commands[${index}].timeout must be a YAML number`;
   }
   return null;
 }
 
 function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | null {
-  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "commands")) {
+  if (hasOwn(rawFrontmatter, "commands")) {
     const commands = rawFrontmatter.commands;
     if (!Array.isArray(commands)) {
       return "Invalid RALPH frontmatter: commands must be a YAML sequence";
@@ -308,57 +327,49 @@ function validateRawFrontmatterShape(rawFrontmatter: UnknownRecord): string | nu
     }
   }
 
-  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "completion_gate")) {
+  if (hasAliasedValue(rawFrontmatter, "completion_gate", "completionGate")) {
     const completionGateError = validateRawCompletionGateShape(rawFrontmatter);
     if (completionGateError) {
       return completionGateError;
     }
   }
 
-  if (
-    Object.prototype.hasOwnProperty.call(rawFrontmatter, "required_outputs")
-  ) {
+  if (hasAliasedValue(rawFrontmatter, "required_outputs", "requiredOutputs")) {
     const requiredOutputsError = validateRawRequiredOutputsShape(rawFrontmatter);
     if (requiredOutputsError) {
       return requiredOutputsError;
     }
   }
 
-  if (Object.prototype.hasOwnProperty.call(rawFrontmatter, "args")) {
+  if (hasOwn(rawFrontmatter, "args")) {
     const argsError = validateRawArgsShape(rawFrontmatter);
     if (argsError) {
       return argsError;
     }
   }
 
-  if (
-    Object.prototype.hasOwnProperty.call(rawFrontmatter, "max_iterations") &&
-    (typeof rawFrontmatter.max_iterations !== "number" || !Number.isFinite(rawFrontmatter.max_iterations))
-  ) {
+  const stopOnErrorError = validateRawStopOnErrorShape(rawFrontmatter);
+  if (stopOnErrorError) {
+    return stopOnErrorError;
+  }
+
+  const maxIterations = readAliasedValue(rawFrontmatter, "max_iterations", "maxIterations");
+  if (maxIterations !== undefined && (typeof maxIterations !== "number" || !Number.isFinite(maxIterations))) {
     return "Invalid RALPH frontmatter: max_iterations must be a YAML number";
   }
-  if (
-    Object.prototype.hasOwnProperty.call(rawFrontmatter, "items_per_iteration") &&
-    (typeof rawFrontmatter.items_per_iteration !== "number" || !Number.isFinite(rawFrontmatter.items_per_iteration))
-  ) {
+  const itemsPerIteration = readAliasedValue(rawFrontmatter, "items_per_iteration", "itemsPerIteration");
+  if (itemsPerIteration !== undefined && (typeof itemsPerIteration !== "number" || !Number.isFinite(itemsPerIteration))) {
     return "Invalid RALPH frontmatter: items_per_iteration must be a YAML number";
   }
-  if (
-    Object.prototype.hasOwnProperty.call(rawFrontmatter, "reflect_every") &&
-    (typeof rawFrontmatter.reflect_every !== "number" || !Number.isFinite(rawFrontmatter.reflect_every))
-  ) {
+  const reflectEvery = readAliasedValue(rawFrontmatter, "reflect_every", "reflectEvery");
+  if (reflectEvery !== undefined && (typeof reflectEvery !== "number" || !Number.isFinite(reflectEvery))) {
     return "Invalid RALPH frontmatter: reflect_every must be a YAML number";
   }
-  if (
-    Object.prototype.hasOwnProperty.call(rawFrontmatter, "inter_iteration_delay") &&
-    (typeof rawFrontmatter.inter_iteration_delay !== "number" || !Number.isFinite(rawFrontmatter.inter_iteration_delay))
-  ) {
+  const interIterationDelay = readAliasedValue(rawFrontmatter, "inter_iteration_delay", "interIterationDelay");
+  if (interIterationDelay !== undefined && (typeof interIterationDelay !== "number" || !Number.isFinite(interIterationDelay))) {
     return "Invalid RALPH frontmatter: inter_iteration_delay must be a YAML number";
   }
-  if (
-    Object.prototype.hasOwnProperty.call(rawFrontmatter, "timeout") &&
-    (typeof rawFrontmatter.timeout !== "number" || !Number.isFinite(rawFrontmatter.timeout))
-  ) {
+  if (hasOwn(rawFrontmatter, "timeout") && (typeof rawFrontmatter.timeout !== "number" || !Number.isFinite(rawFrontmatter.timeout))) {
     return "Invalid RALPH frontmatter: timeout must be a YAML number";
   }
   return null;
@@ -623,27 +634,29 @@ export function parseRalphMarkdown(raw: string): ParsedRalph {
   });
   const parsedArgs = parseStringArray(yaml.args);
   const guardrails = isRecord(yaml.guardrails) ? yaml.guardrails : {};
-  const rawShellPolicy = isRecord(guardrails.shell_policy) ? guardrails.shell_policy : undefined;
-  const itemsPerIteration = parseOptionalNumber(yaml.items_per_iteration);
-  const reflectEvery = parseOptionalNumber(yaml.reflect_every);
+  const rawShellPolicyValue = readAliasedValue(guardrails, "shell_policy", "shellPolicy");
+  const rawShellPolicy = isRecord(rawShellPolicyValue) ? rawShellPolicyValue : undefined;
+  const itemsPerIteration = parseOptionalNumber(readAliasedValue(yaml, "items_per_iteration", "itemsPerIteration"));
+  const reflectEvery = parseOptionalNumber(readAliasedValue(yaml, "reflect_every", "reflectEvery"));
+  const completionPromise = readAliasedValue(yaml, "completion_promise", "completionPromise");
+  const completionGate = readAliasedValue(yaml, "completion_gate", "completionGate");
 
   return {
     frontmatter: {
       commands,
       ...(parsedArgs.values.length > 0 ? { args: parsedArgs.values } : {}),
-      maxIterations: Number(yaml.max_iterations ?? 50),
-      interIterationDelay: Number(yaml.inter_iteration_delay ?? 0),
+      maxIterations: Number(readAliasedValue(yaml, "max_iterations", "maxIterations") ?? 50),
+      interIterationDelay: Number(readAliasedValue(yaml, "inter_iteration_delay", "interIterationDelay") ?? 0),
       ...(itemsPerIteration !== undefined ? { itemsPerIteration } : {}),
       ...(reflectEvery !== undefined ? { reflectEvery } : {}),
       timeout: Number(yaml.timeout ?? 300),
-      completionPromise:
-        typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
-      ...(typeof yaml.completion_gate === "string" && yaml.completion_gate.trim() ? { completionGate: yaml.completion_gate as CompletionGateMode } : {}),
-      requiredOutputs: toStringArray(yaml.required_outputs),
-      stopOnError: yaml.stop_on_error === false ? false : true,
+      completionPromise: typeof completionPromise === "string" && completionPromise.trim() ? completionPromise : undefined,
+      ...(typeof completionGate === "string" && completionGate.trim() ? { completionGate: completionGate as CompletionGateMode } : {}),
+      requiredOutputs: toStringArray(readAliasedValue(yaml, "required_outputs", "requiredOutputs")),
+      stopOnError: readAliasedValue(yaml, "stop_on_error", "stopOnError") === false ? false : true,
       guardrails: {
-        blockCommands: toStringArray(guardrails.block_commands),
-        protectedFiles: toStringArray(guardrails.protected_files),
+        blockCommands: toStringArray(readAliasedValue(guardrails, "block_commands", "blockCommands")),
+        protectedFiles: toStringArray(readAliasedValue(guardrails, "protected_files", "protectedFiles")),
         ...(rawShellPolicy
           ? {
               shellPolicy:
@@ -679,8 +692,8 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
   if (fm.reflectEvery !== undefined && (!Number.isFinite(fm.reflectEvery) || !Number.isInteger(fm.reflectEvery) || fm.reflectEvery < 2 || fm.reflectEvery > 20)) {
     return "Invalid reflect_every: must be an integer between 2 and 20";
   }
-  if (!Number.isFinite(fm.timeout) || fm.timeout <= 0 || fm.timeout > 300) {
-    return "Invalid timeout: must be greater than 0 and at most 300";
+  if (!Number.isFinite(fm.timeout) || fm.timeout <= 0 || fm.timeout > MAX_TIMEOUT_SECONDS) {
+    return `Invalid timeout: must be greater than 0 and at most ${MAX_TIMEOUT_SECONDS}`;
   }
   if (fm.completionPromise !== undefined && !isSafeCompletionPromise(fm.completionPromise)) {
     return "Invalid completion_promise: must be a single-line string without line breaks or angle brackets";
@@ -754,8 +767,8 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
     if (!cmd.run.trim()) {
       return `Invalid command ${cmd.name}: run is required`;
     }
-    if (!Number.isFinite(cmd.timeout) || cmd.timeout <= 0 || cmd.timeout > 300) {
-      return `Invalid command ${cmd.name}: timeout must be greater than 0 and at most 300`;
+    if (!Number.isFinite(cmd.timeout) || cmd.timeout <= 0 || cmd.timeout > MAX_TIMEOUT_SECONDS) {
+      return `Invalid command ${cmd.name}: timeout must be greater than 0 and at most ${MAX_TIMEOUT_SECONDS}`;
     }
     if (cmd.timeout > fm.timeout) {
       return `Invalid command ${cmd.name}: timeout must not exceed top-level timeout`;
@@ -765,10 +778,10 @@ export function validateFrontmatter(fm: Frontmatter): string | null {
 }
 
 function parseCompletionPromiseValue(yaml: UnknownRecord): { present: boolean; value?: string; invalid: boolean } {
-  if (!Object.prototype.hasOwnProperty.call(yaml, "completion_promise")) {
+  if (!hasAliasedValue(yaml, "completion_promise", "completionPromise")) {
     return { present: false, invalid: false };
   }
-  const value = yaml.completion_promise;
+  const value = readAliasedValue(yaml, "completion_promise", "completionPromise");
   if (typeof value !== "string" || !value.trim() || !isSafeCompletionPromise(value)) {
     return { present: true, invalid: true };
   }

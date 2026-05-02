@@ -37,6 +37,32 @@ People use ralph loops for:
 pi install npm:@lnilluv/pi-ralph-loop
 ```
 
+## For Pi agents and automation
+
+`/ralph` is a **Pi slash command**, not a shell executable. Do not run `/ralph ...` with `bash`; bash will correctly say `No such file or directory`.
+
+If the user intended a bare `/ralph ...` command but it reaches the assistant as normal chat, the command was not intercepted by Pi. Treat that as an extension loading problem, not as a request to manually simulate the loop. Ask the user to run `pi install npm:@lnilluv/pi-ralph-loop`, then `/reload` or restart Pi, and retry the slash command.
+
+Useful checks (`pi list` is authoritative; `npm list -g` only checks global npm installs):
+
+```bash
+pi list | grep '@lnilluv/pi-ralph-loop'
+npm list -g @lnilluv/pi-ralph-loop --depth=0
+```
+
+`pi --help` lists CLI flags, not extension slash commands, so `pi --help | grep ralph` is not a valid install check.
+
+From an assistant turn, either:
+
+1. prepare a task folder with `RALPH.md`, then tell the user to run `/ralph --path ./task`, or
+2. when a noninteractive smoke test is explicitly wanted, run Pi itself with the slash command as the prompt:
+
+```bash
+pi -p "/ralph --path ./task"
+```
+
+`RALPH.md` frontmatter should use `snake_case` keys. Common camelCase aliases are accepted for compatibility with LLM-authored drafts, but new files should prefer `max_iterations`, `inter_iteration_delay`, `completion_promise`, `completion_gate`, `required_outputs`, `stop_on_error`, `guardrails.block_commands`, and `guardrails.protected_files`.
+
 ## Quick start
 
 ### From plain language
@@ -108,7 +134,7 @@ Put scripts, reference docs, and data files alongside `RALPH.md`. The agent can 
 
 ## RALPH.md format
 
-YAML header (configuration) + Markdown body (the prompt). The header uses `snake_case` keys.
+YAML header (configuration) + Markdown body (the prompt). The header uses `snake_case` keys. Common camelCase aliases are accepted for compatibility, but new `RALPH.md` files should use the documented `snake_case` form.
 
 ```yaml
 ---
@@ -153,13 +179,13 @@ Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists
 
 | YAML key | Type | Default | Description |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–300s, default 60) |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`) |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
 | `items_per_iteration` | integer | — | Pacing cap for each iteration. Valid values: 1–20 |
 | `reflect_every` | integer | — | Reflection cadence. Valid values: 2–20 |
-| `timeout` | integer | `300` | 1–300 seconds per iteration |
+| `timeout` | integer | `300` | 1–3600 seconds per iteration |
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
 | `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether the promise, required outputs, and OPEN_QUESTIONS.md readiness block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for early stop |

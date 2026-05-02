@@ -1,11 +1,20 @@
 ---
 name: ralph-draft
-description: Use when turning a plain-language task into a RALPH.md or scaffolding a loop prompt. Covers task classification, bounded project detection, frontmatter generation, and guardrail selection.
+description: Use when turning a plain-language task into a RALPH.md, scaffolding a loop prompt, or helping a user prepare /ralph or /ralph-draft. Trigger on ralph, Ralph loop, pi-ralph-loop, RALPH.md, autonomous loop, or draft a loop. Covers native Pi slash-command boundaries, task classification, bounded project detection, snake_case frontmatter generation, and guardrail selection.
 ---
 
 # Draft a RALPH.md
 
 Create an effective `RALPH.md` from a plain-language task description. Match the task to the shipped mode, inspect only the bounded repo signals the generator actually uses, and keep the prompt body aligned with what `/ralph-draft` emits today.
+
+## Native Pi command boundaries
+
+- `/ralph` and `/ralph-draft` are Pi slash commands, not shell executables. Do not run `/ralph ...` or `/ralph-draft ...` directly through `bash`.
+- If the user intended a bare `/ralph ...` command but it reaches you as normal chat, Pi did not intercept the command. Do not manually simulate the loop; ask the user to run `pi install npm:@lnilluv/pi-ralph-loop`, then `/reload` or restart Pi, and retry the slash command.
+- `pi --help` does not list extension slash commands. Use `pi list` to verify that `npm:@lnilluv/pi-ralph-loop` is installed.
+- When preparing a loop from assistant code tools, write the task folder and `RALPH.md`, then tell the user to run `/ralph --path ./task`.
+- For explicit noninteractive smoke tests, run Pi itself with the slash command as the prompt, for example `pi -p "/ralph --path ./task"`. Do not run `/ralph` directly in bash.
+- Use `snake_case` YAML keys in new `RALPH.md` files. The parser accepts common camelCase aliases for compatibility, but generated and hand-authored drafts should use the documented snake_case keys.
 
 ## Phase 1: Classify the task
 
