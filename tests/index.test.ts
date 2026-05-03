@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import registerRalphCommands, { parseLogExportArgs, runCommands } from "../src/index.ts";
+import registerRalphCommands, { parseLogExportArgs, parseStatusCommandArgs, runCommands } from "../src/index.ts";
 import { SECRET_PATH_POLICY_TOKEN } from "../src/secret-paths.ts";
 import { generateDraft, inspectDraftContent, parseRalphMarkdown, slugifyTask, validateFrontmatter, type DraftPlan, type DraftTarget } from "../src/ralph.ts";
 import type { StrengthenDraftRuntime } from "../src/ralph-draft-llm.ts";
@@ -1100,6 +1100,7 @@ test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) 
   writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), "{\"iteration\":1}\n{\"iteration\":2}\n", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), "{\"event\":1}\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "final-summary.md"), "# Final summary\n", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "one.txt"), "one", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "two.txt"), "two", "utf8");
 
@@ -1125,6 +1126,7 @@ test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) 
   assert.equal(existsSync(join(exportedDir, "status.json")), true);
   assert.equal(readFileSync(join(exportedDir, "iterations.jsonl"), "utf8"), "{\"iteration\":1}\n{\"iteration\":2}\n");
   assert.equal(readFileSync(join(exportedDir, "events.jsonl"), "utf8"), "{\"event\":1}\n");
+  assert.equal(readFileSync(join(exportedDir, "final-summary.md"), "utf8"), "# Final summary\n");
   assert.equal(readFileSync(join(exportedDir, "transcripts", "one.txt"), "utf8"), "one");
   assert.equal(readFileSync(join(exportedDir, "transcripts", "two.txt"), "utf8"), "two");
   assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts to ./exported")));
@@ -1159,8 +1161,228 @@ test("/ralph-logs fails when no .ralph-runner/ exists", async (t) => {
   assert.ok(notifications.some(({ message, level }) => level === "error" && message.startsWith("Log export failed: No .ralph-runner directory found at ")));
 });
 
-test("parseLogExportArgs parses --dest correctly", () => {
+test("parseLogExportArgs parses --dest and quoted paths correctly", () => {
   assert.deepEqual(parseLogExportArgs("my-task --dest exported"), { path: "my-task", dest: "exported" });
+  assert.deepEqual(parseLogExportArgs('"my task" --dest "export dir"'), { path: "my task", dest: "export dir" });
+  assert.deepEqual(parseLogExportArgs('"unterminated'), { error: "Unterminated quote in /ralph-logs arguments." });
+});
+
+test("parseStatusCommandArgs treats --summary as an unquoted flag only", () => {
+  assert.deepEqual(parseStatusCommandArgs("my-task --summary"), { value: "my-task", summary: true });
+  assert.deepEqual(parseStatusCommandArgs('"my task" --summary'), { value: "my task", summary: true });
+  assert.deepEqual(parseStatusCommandArgs('"my task --summary"'), { value: "my task --summary", summary: false });
+  assert.deepEqual(parseStatusCommandArgs('"unterminated'), { value: "", summary: false, error: "Unterminated quote in /ralph-status arguments." });
+});
+
+test("/ralph-logs skips symlinked final-summary artifacts", async (t) => {
+  const cwd = createTempDir();
+  const outside = createTempDir();
+  t.after(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  writeFileSync(join(outside, "secret-summary.md"), "secret", "utf8");
+  symlinkSync(join(outside, "secret-summary.md"), join(taskDir, ".ralph-runner", "final-summary.md"));
+
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  const exportedDir = join(cwd, "exported");
+  assert.equal(existsSync(join(exportedDir, "status.json")), true);
+  assert.equal(existsSync(join(exportedDir, "final-summary.md")), false);
+});
+
+test("/ralph-logs rejects symlinked destination parent path segments", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  const outside = join(cwd, "outside");
+  mkdirSync(join(outside, "exported"), { recursive: true });
+  symlinkSync(outside, join(cwd, "linked-parent"), "dir");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest linked-parent/exported", ctx);
+
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Log export failed")));
+  assert.equal(existsSync(join(outside, "exported", "status.json")), false);
+});
+
+test("/ralph-logs rejects source task paths reached through symlinked parents", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const realRoot = join(cwd, "real-root");
+  const taskDir = join(realRoot, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  symlinkSync(realRoot, join(cwd, "linked-root"), "dir");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("linked-root/my-task --dest exported", ctx);
+
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Log export failed")));
+  assert.equal(existsSync(join(cwd, "exported", "status.json")), false);
+});
+
+test("/ralph-logs rejects non-empty destinations instead of using stale artifacts", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  mkdirSync(join(cwd, "exported"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  writeFileSync(join(cwd, "exported", "iterations.jsonl"), "{\"stale\":true}\n", "utf8");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Export destination must be empty")));
+  assert.equal(existsSync(join(cwd, "exported", "status.json")), false);
+});
+
+test("/ralph-logs does not overwrite symlinked destination final summaries", async (t) => {
+  const cwd = createTempDir();
+  const outside = createTempDir();
+  t.after(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  mkdirSync(join(cwd, "exported"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "final-summary.md"), "# Safe summary\n", "utf8");
+  const outsideFile = join(outside, "outside.md");
+  writeFileSync(outsideFile, "do not overwrite", "utf8");
+  symlinkSync(outsideFile, join(cwd, "exported", "final-summary.md"));
+
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  assert.equal(readFileSync(outsideFile, "utf8"), "do not overwrite");
+});
+
+test("/ralph-logs does not overwrite symlinked destination transcript entries", async (t) => {
+  const cwd = createTempDir();
+  const outside = createTempDir();
+  t.after(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner", "transcripts"), { recursive: true });
+  mkdirSync(join(cwd, "exported", "transcripts"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "one.txt"), "safe transcript", "utf8");
+  const outsideFile = join(outside, "outside.txt");
+  writeFileSync(outsideFile, "do not overwrite", "utf8");
+  symlinkSync(outsideFile, join(cwd, "exported", "transcripts", "one.txt"));
+
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  assert.equal(readFileSync(outsideFile, "utf8"), "do not overwrite");
 });
 
 test("parseLogExportArgs parses quoted paths with spaces", () => {

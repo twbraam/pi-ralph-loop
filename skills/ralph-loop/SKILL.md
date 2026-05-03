@@ -42,13 +42,13 @@ You have these command forms available:
 | `/ralph --path ./dir --arg key=val` | Start an existing task folder with args |
 | `/ralph-draft "task description"` | Create a draft without starting |
 | `/ralph-list` | List active loops |
-| `/ralph-status [path]` | Show durable status and the latest iteration summary |
+| `/ralph-status [path] [--summary]` | Show durable status and latest iteration details; `--summary` renders deterministic handoff context |
 | `/ralph-resume <path>` | Start a new run from an existing `RALPH.md` |
 | `/ralph-archive <path>` | Move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/` |
 | `/ralph-stop [task folder or RALPH.md]` | Graceful stop after current iteration |
 | `/ralph-cancel [task folder or RALPH.md]` | Kill the current iteration immediately |
 | `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter RALPH.md template |
-| `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>]` | Export run artifacts |
+| `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>]` | Export run artifacts, including `final-summary.md` when present |
 
 Bundled presets:
 
@@ -280,6 +280,8 @@ You can omit `shell_policy` entirely unless you need an allowlist.
 ## Progress memory
 
 `RALPH_PROGRESS.md` in the task directory is injected as rolling memory (max 4096 chars) each iteration. The loop reads it before each iteration and truncates it if it grows too large.
+
+When a run reaches a terminal status, Ralph writes `.ralph-runner/final-summary.md`. Use `/ralph-status --summary <task>` to regenerate the same deterministic handoff summary from durable artifacts without asking an LLM to summarize.
 
 Use it for:
 - Tracking what's been done across iterations

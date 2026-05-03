@@ -43,6 +43,7 @@ import {
   type RpcSubprocessResult,
   runRpcIteration,
 } from "./runner-rpc.ts";
+import { writeRalphFinalSummary } from "./runner-summary.ts";
 import { createHash } from "node:crypto";
 import {
   readdirSync,
@@ -1174,6 +1175,9 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       ...initialStatus,
       status: finalStatus,
       currentIteration: iterations.length > 0 ? iterations[iterations.length - 1].iteration : 0,
+      maxIterations: currentMaxIterations,
+      timeout: currentTimeout,
+      completionPromise: currentCompletionPromise,
       completedAt,
       guardrails: currentGuardrails,
     };
@@ -1187,6 +1191,12 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       iterations: iterations.length,
       totalDurationMs: Date.now() - startMs,
     });
+    try {
+      writeRalphFinalSummary(taskDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      onNotify?.(`Failed to write final Ralph summary: ${message}`, "warning");
+    }
     onStatusChange?.(finalStatus);
 
     const totalMs = Date.now() - startMs;

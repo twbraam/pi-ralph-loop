@@ -34,6 +34,7 @@ import type { CommandDef, CommandOutput, DraftPlan, DraftTarget, Frontmatter, Ru
 import { createDraftPlan as createDraftPlanService } from "./ralph-draft.ts";
 import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
 import { runRalphLoop } from "./runner.ts";
+import { buildRalphRunSummary } from "./runner-summary.ts";
 import {
   checkStopSignal,
   createStopSignal,
@@ -1178,6 +1179,21 @@ function getSelectedThinkingLevel(ctx: CommandContext, fallback?: string): strin
   return undefined;
 }
 
+export function parseStatusCommandArgs(raw: string): { value: string; summary: boolean; error?: string } {
+  const tokenized = tokenizeArgsWithQuoteInfo(raw, "/ralph-status");
+  if (tokenized.error) return { value: "", summary: false, error: tokenized.error };
+  const valueTokens: string[] = [];
+  let summary = false;
+  for (const token of tokenized.tokens) {
+    if (!token.quoted && token.value === "--summary") {
+      summary = true;
+    } else {
+      valueTokens.push(token.value);
+    }
+  }
+  return { value: valueTokens.join(" ").trim(), summary };
+}
+
 function summarizeIterationRecord(record: IterationRecord): string {
   const parts = [`lastIteration: #${record.iteration}`];
   if (typeof record.durationMs === "number") {
@@ -1489,6 +1505,19 @@ function exportRalphLogs(taskDir: string, destDir: string): { iterations: number
         loopToken = parseLoopTokenFromStatusBytes(data);
         return data;
       });
+    }
+
+    const summaryPath = join(runnerDir, "final-summary.md");
+    if (existsSync(summaryPath)) {
+      let stat;
+      try {
+        stat = lstatSync(summaryPath);
+      } catch {
+        stat = undefined;
+      }
+      if (stat?.isFile() && !stat.isSymbolicLink()) {
+        copyExportFileNoOverwrite(summaryPath, join(preparedDest.stagingDir, "final-summary.md"), runnerRootRealPath, stagingRootRealPath);
+      }
     }
 
     for (const file of ["iterations.jsonl", "events.jsonl"]) {
@@ -2425,7 +2454,12 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   pi.registerCommand("ralph-status", {
     description: "Show durable Ralph run status",
     handler: async (args: string, ctx: CommandContext) => {
-      const parsed = parseCommandArgs(args ?? "");
+      const statusArgs = parseStatusCommandArgs(args ?? "");
+      if (statusArgs.error) {
+        ctx.ui.notify(statusArgs.error, "error");
+        return;
+      }
+      const parsed = parseCommandArgs(statusArgs.value);
       if (parsed.error) {
         ctx.ui.notify(parsed.error, "error");
         return;
@@ -2437,6 +2471,11 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const statusFile = readStatusFile(target.taskDir);
       if (!statusFile) {
         ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, target.taskDir)}.`, "warning");
+        return;
+      }
+
+      if (statusArgs.summary) {
+        ctx.ui.notify(buildRalphRunSummary(target.taskDir), "info");
         return;
       }
 
