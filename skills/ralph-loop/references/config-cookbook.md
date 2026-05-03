@@ -12,6 +12,7 @@ commands:
   - name: tests
     run: npm test
     timeout: 60
+    acceptance: true
 max_iterations: 20
 completion_promise: DONE
 completion_gate: required
@@ -25,7 +26,7 @@ guardrails:
 ---
 ```
 
-Use when you want a hard stop only after tests pass, TEST_REPORT.md exists, and OPEN_QUESTIONS.md is clear.
+Use when you want a hard stop only after tests pass on a fresh acceptance rerun, TEST_REPORT.md exists, and OPEN_QUESTIONS.md is clear.
 
 ## 2. Make a migration
 
@@ -35,9 +36,11 @@ commands:
   - name: build
     run: npm run build
     timeout: 60
+    acceptance: true
   - name: tests
     run: npm test
     timeout: 120
+    acceptance: true
 max_iterations: 30
 completion_promise: DONE
 completion_gate: required
@@ -51,7 +54,7 @@ guardrails:
 ---
 ```
 
-Use when the loop should keep going through multiple passes and the deliverable and OPEN_QUESTIONS.md are mandatory.
+Use when the loop should keep going through multiple passes and the deliverable, OPEN_QUESTIONS.md, and fresh build/tests are mandatory.
 
 ## 3. Draft documentation
 
@@ -99,6 +102,7 @@ commands:
   - name: scan
     run: npm audit --omit=dev
     timeout: 120
+    acceptance: true
 max_iterations: 20
 completion_promise: DONE
 completion_gate: required
@@ -118,7 +122,7 @@ guardrails:
 ---
 ```
 
-Use when missing evidence should keep the loop running until the report and OPEN_QUESTIONS.md are ready.
+Use when missing evidence should keep the loop running until the report, OPEN_QUESTIONS.md, and fresh scan are ready.
 
 ## 6. Loop without a completion gate
 

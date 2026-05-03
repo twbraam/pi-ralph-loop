@@ -73,7 +73,7 @@ my-task/
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`) |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`), optional `acceptance: true` |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
@@ -81,7 +81,7 @@ my-task/
 | `reflect_every` | integer | — | Reflection cadence. Valid values: 2–20 |
 | `timeout` | integer | `300` | Seconds per iteration. Valid values: 1–3600 |
 | `completion_promise` | string | — | Done marker. Single line, no `<>` or line breaks |
-| `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether required outputs and OPEN_QUESTIONS.md block stopping |
+| `completion_gate` | `required` \| `optional` \| `disabled` | `required` when `completion_promise` is set | Controls whether required outputs, OPEN_QUESTIONS.md readiness, and `acceptance: true` reruns block stopping |
 | `required_outputs` | string[] | `[]` | Relative file paths that must exist for completion |
 | `stop_on_error` | boolean | `true` | `false` continues past RPC errors and timeouts |
 | `guardrails.block_commands` | string[] | `[]` | Default shell blocklist. Matching bash commands are blocked |
@@ -188,9 +188,9 @@ Write `RALPH.md` prompts so this audit has clear material to check: named delive
 
 ### Completion (include when early stopping is knowable)
 
-Use `completion_promise` to define an early stop signal. Use `completion_gate` to decide whether required outputs and OPEN_QUESTIONS.md can block stopping:
+Use `completion_promise` to define an early stop signal. Use `completion_gate` to decide whether required outputs, OPEN_QUESTIONS.md, and `commands[].acceptance: true` reruns can block stopping:
 
-- `required` — the default when `completion_promise` is set; the loop stops only when the promise, required outputs, and OPEN_QUESTIONS.md are all ready
+- `required` — the default when `completion_promise` is set; the loop stops only when the promise, required outputs, OPEN_QUESTIONS.md, and any `commands[].acceptance: true` reruns are all ready
 - `optional` — the prompt still reminds the agent about outputs and OPEN_QUESTIONS.md, but `complete` can happen once the promise is emitted
 - `disabled` — the loop skips completion-gate reminders and checks, so `complete` can happen once the promise is emitted
 
@@ -209,7 +209,7 @@ Stop with <promise>DONE</promise> only when:
 3. OPEN_QUESTIONS.md exists and has no unresolved P0/P1 items
 ```
 
-If the promise appears but files are missing, the loop continues with a rejection notice.
+If the promise appears but files, OPEN_QUESTIONS.md, or acceptance commands are not ready, the loop continues with a rejection notice. Mark commands that must be fresh at completion time with `acceptance: true`; Ralph reruns them after a completion promise before a required gate can stop, and any `blocked`, `timeout`, `error`, or non-zero exit outcome keeps the loop going.
 
 ## Guardrails
 
@@ -270,7 +270,7 @@ You can omit `shell_policy` entirely unless you need an allowlist.
 |---|---|
 | `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
 | `/ralph-cancel [task folder or RALPH.md]` | Kill current iteration immediately |
-| Completion promise + gate | Stop when the promise is matched; `required` gates also require `required_outputs` and OPEN_QUESTIONS.md |
+| Completion promise + gate | Stop when the promise is matched; `required` gates also require `required_outputs`, OPEN_QUESTIONS.md readiness, and successful `acceptance: true` reruns |
 | `max_iterations` reached | Stop after N iterations |
 | No progress in every iteration | Stop with `no-progress-exhaustion` |
 | `stop_on_error: true` (default) | Stop on RPC error or timeout |

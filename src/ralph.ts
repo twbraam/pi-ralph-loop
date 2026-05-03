@@ -3,7 +3,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { SECRET_PATH_POLICY_TOKEN, filterSecretBearingTopLevelNames, isSecretBearingPath, isSecretBearingTopLevelName } from "./secret-paths.ts";
 
-export type CommandDef = { name: string; run: string; timeout: number };
+export type CommandDef = { name: string; run: string; timeout: number; acceptance?: boolean };
 export type DraftSource = "deterministic" | "llm-strengthened" | "fallback";
 export type DraftStrengtheningScope = "body-only" | "body-and-commands";
 export type CompletionGateMode = "required" | "optional" | "disabled";
@@ -30,7 +30,32 @@ export type Frontmatter = {
   invalidArgEntries?: number[];
 };
 export type ParsedRalph = { frontmatter: Frontmatter; body: string };
-export type CommandOutput = { name: string; output: string };
+export type CommandStatus = "ok" | "blocked" | "timeout" | "error";
+const COMMAND_OUTPUT_RENDER_MAX_CHARS = 12_000;
+
+function boundedRenderedCommandOutput(output: string): string {
+  if (output.length <= COMMAND_OUTPUT_RENDER_MAX_CHARS) return output;
+  const outputBytes = Buffer.byteLength(output, "utf8");
+  const marker = `\n[ralph: command output truncated after ${COMMAND_OUTPUT_RENDER_MAX_CHARS} chars; original ${outputBytes} bytes]\n`;
+  const visibleChars = Math.max(0, COMMAND_OUTPUT_RENDER_MAX_CHARS - marker.length);
+  const headChars = Math.floor(visibleChars * 0.7);
+  const tailChars = visibleChars - headChars;
+  return `${output.slice(0, headChars)}${marker}${output.slice(-tailChars)}`;
+}
+
+export type CommandOutput = {
+  name: string;
+  output: string;
+  status?: CommandStatus;
+  acceptance?: boolean;
+  command?: string;
+  cwd?: string;
+  blockedPattern?: string;
+  timedOut?: boolean;
+  outputTruncated?: boolean;
+  outputBytes?: number;
+  durationMs?: number;
+};
 export type RalphTargetResolution = {
   target: string;
   absoluteTarget: string;
@@ -142,6 +167,7 @@ function parseCommandDef(value: unknown): CommandDef | null {
     name: String(value.name ?? ""),
     run: String(value.run ?? ""),
     timeout: Number(value.timeout ?? 60),
+    ...(value.acceptance === true ? { acceptance: true } : {}),
   };
 }
 
@@ -311,6 +337,9 @@ function validateRawCommandEntryShape(command: unknown, index: number): string |
   }
   if (hasOwn(command, "timeout") && typeof command.timeout !== "number") {
     return `Invalid RALPH frontmatter: commands[${index}].timeout must be a YAML number`;
+  }
+  if (hasOwn(command, "acceptance") && typeof command.acceptance !== "boolean") {
+    return `Invalid RALPH frontmatter: commands[${index}].acceptance must be a YAML boolean`;
   }
   return null;
 }
@@ -576,7 +605,7 @@ function yamlQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function renderCommandsYaml(commands: CommandDef[]): string[] {
+export function renderCommandsYaml(commands: CommandDef[]): string[] {
   if (commands.length === 0) return ["commands: []"];
   return [
     "commands:",
@@ -584,6 +613,7 @@ function renderCommandsYaml(commands: CommandDef[]): string[] {
       `  - name: ${command.name}`,
       `    run: ${yamlQuote(command.run)}`,
       `    timeout: ${command.timeout}`,
+      ...(command.acceptance ? ["    acceptance: true"] : []),
     ]),
   ];
 }
@@ -1622,7 +1652,7 @@ export function resolvePlaceholders(
   ralph: { iteration: number; name: string; maxIterations: number },
   runtimeArgs: RuntimeArgs = {},
 ): string {
-  const map = new Map(outputs.map((o) => [o.name, o.output]));
+  const map = new Map(outputs.map((o) => [o.name, boundedRenderedCommandOutput(o.output)]));
   const resolved = replaceArgsPlaceholders(
     body
       .replace(/\{\{\s*ralph\.iteration\s*\}\}/g, String(ralph.iteration))

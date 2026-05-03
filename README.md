@@ -144,9 +144,11 @@ commands:
   - name: tests
     run: npm test
     timeout: 60
+    acceptance: true
   - name: verify
     run: ./scripts/verify.sh
     timeout: 60
+    acceptance: true
 max_iterations: 20
 timeout: 120
 completion_promise: DONE
@@ -179,7 +181,7 @@ Stop with <promise>DONE</promise> only when all tests pass, AUTH_FIXES.md exists
 
 | YAML key | Type | Default | Description |
 |---|---|---|---|
-| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`) |
+| `commands` | CommandDef[] | `[]` | Shell commands run each iteration. Each: `name`, `run`, `timeout` (1–3600s, default 60; must not exceed top-level `timeout`), optional `acceptance: true` |
 | `args` | string[] | `[]` | Declared runtime parameters for `--arg name=value` |
 | `max_iterations` | integer | `50` | 1–50 |
 | `inter_iteration_delay` | integer | `0` | Seconds between iterations |
@@ -215,7 +217,7 @@ reflect_every: 4
 | `{{ ralph.name }}` | Task directory basename |
 | `{{ ralph.max_iterations }}` | Current max iterations |
 
-Commands starting with `./` run from the task directory. Others run from the project root. Blocked commands produce `[blocked by guardrail: PATTERN]`. Timed-out commands produce `[timed out after Ns]`.
+Commands starting with `./` run from the task directory. Others run from the project root. Blocked commands produce `[blocked by guardrail: PATTERN]`. Timed-out commands produce `[timed out after Ns]`. Non-zero exits are recorded as `error`. Ralph records each command outcome as `ok`, `blocked`, `timeout`, or `error` in durable iteration metadata with a bounded output preview. Command output included in prompts/transcripts is capped with a truncation marker and byte count.
 
 ### Goal continuation audits
 
@@ -252,13 +254,13 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 |---|---|
 | `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
 | `/ralph-cancel [task folder or RALPH.md]` | Kill the current iteration immediately |
-| Completion promise + gate | Stop when the promise is matched; only `required` gates also wait for `required_outputs` and OPEN_QUESTIONS.md readiness |
+| Completion promise + gate | Stop when the promise is matched; `required` gates also wait for `required_outputs`, OPEN_QUESTIONS.md readiness, and successful `acceptance: true` reruns |
 | Max iterations reached | Stop after the last iteration |
 | No progress for all iterations | Stop with `no-progress-exhaustion` |
 
 ## Completion gating
 
-`completion_gate` controls how strictly the loop treats completion promises:
+`completion_gate` controls how strictly the loop treats completion promises. Commands marked `acceptance: true` still provide normal pre-iteration evidence, and when a `required` gate is otherwise ready after a completion promise, Ralph reruns those acceptance commands before stopping. Any acceptance outcome other than `ok` blocks completion and is recorded in iteration metadata/events.
 
 | Mode | Behavior |
 |---|---|
@@ -268,13 +270,14 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 
 In `optional` and `disabled` mode, `complete` means the promise was matched; those modes do not block on `required_outputs` or OPEN_QUESTIONS.md readiness.
 
-When the gate is `required`, completion still needs **all three** conditions:
+When the gate is `required`, completion still needs **all conditions**:
 
 1. The agent emits `<promise>DONE</promise>` (or whatever marker you set)
 2. Every file in `required_outputs` exists on disk
 3. `OPEN_QUESTIONS.md` is ready to stop, meaning it has no remaining P0/P1 items
+4. Every `commands[].acceptance: true` rerun exits with outcome `ok`
 
-If the promise is seen but files or OPEN_QUESTIONS.md are not ready, the loop continues — the next iteration gets a rejection notice telling the agent what still needs to be fixed.
+If the promise is seen but files, OPEN_QUESTIONS.md, or acceptance commands are not ready, the loop continues — the next iteration gets a rejection notice telling the agent what still needs to be fixed.
 
 `RALPH_PROGRESS.md` is injected as rolling memory (max 4096 chars) and excluded from the `required_outputs` gate.
 

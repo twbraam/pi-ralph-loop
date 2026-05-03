@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type VersionBump = "major" | "minor" | "patch";
+export type VersionBump = "major" | "minor" | "patch" | "none";
 export type ReleaseBranch = "main" | "dev";
 
 export interface ReleaseVersionRequest {
@@ -9,6 +9,7 @@ export interface ReleaseVersionRequest {
   bump: VersionBump;
   npmVersions: readonly string[] | string;
   gitTags: readonly string[] | string;
+  currentVersion?: string;
 }
 
 type ParsedVersion = {
@@ -73,6 +74,33 @@ function isStableVersion(version: string): boolean {
   return STABLE_VERSION.test(version);
 }
 
+function comparePrerelease(left: string | undefined, right: string | undefined): number {
+  if (left === right) return 0;
+  if (left === undefined) return 1;
+  if (right === undefined) return -1;
+
+  const leftParts = left.split(".");
+  const rightParts = right.split(".");
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = leftParts[index];
+    const rightPart = rightParts[index];
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    if (leftPart === rightPart) continue;
+
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) {
+      return Number(leftPart) - Number(rightPart);
+    }
+    if (leftNumeric) return -1;
+    if (rightNumeric) return 1;
+    return leftPart < rightPart ? -1 : 1;
+  }
+  return 0;
+}
+
 function compareVersions(left: string, right: string): number {
   const leftParsed = parseVersion(left);
   const rightParsed = parseVersion(right);
@@ -89,7 +117,11 @@ function compareVersions(left: string, right: string): number {
     return leftParsed.minor - rightParsed.minor;
   }
 
-  return leftParsed.patch - rightParsed.patch;
+  if (leftParsed.patch !== rightParsed.patch) {
+    return leftParsed.patch - rightParsed.patch;
+  }
+
+  return comparePrerelease(leftParsed.prerelease, rightParsed.prerelease);
 }
 
 function maxVersion(versions: string[]): string | null {
@@ -139,7 +171,7 @@ function stableReleaseExistsAtOrAboveOne(npmVersions: readonly string[] | string
 }
 
 function nextPrereleaseNumber(targetStable: string, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): number {
-  const used = new Set<number>();
+  let max = -1;
 
   for (const rawVersion of [...normalizeVersionList(npmVersions), ...normalizeVersionList(gitTags)]) {
     const version = stripGitTagPrefix(rawVersion);
@@ -158,18 +190,90 @@ function nextPrereleaseNumber(targetStable: string, npmVersions: readonly string
       continue;
     }
 
-    used.add(Number(match[1]));
+    max = Math.max(max, Number(match[1]));
   }
 
-  let next = 0;
-  while (used.has(next)) {
-    next += 1;
-  }
-
-  return next;
+  return max + 1;
 }
 
-export function computeReleaseVersion({ branch, bump, npmVersions, gitTags }: ReleaseVersionRequest): string {
+function normalizedNpmVersions(npmVersions: readonly string[] | string): string[] {
+  return normalizeVersionList(npmVersions).map(stripGitTagPrefix);
+}
+
+function normalizedGitTags(gitTags: readonly string[] | string): string[] {
+  return normalizeVersionList(gitTags).map(stripGitTagPrefix);
+}
+
+function hasNpmVersion(version: string, npmVersions: readonly string[] | string): boolean {
+  const normalized = stripGitTagPrefix(version.trim());
+  return normalizedNpmVersions(npmVersions).includes(normalized);
+}
+
+function hasGitTag(version: string, gitTags: readonly string[] | string): boolean {
+  const normalized = stripGitTagPrefix(version.trim());
+  return normalizedGitTags(gitTags).includes(normalized);
+}
+
+function releasePresence(version: string, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): { npm: boolean; git: boolean } {
+  return {
+    npm: hasNpmVersion(version, npmVersions),
+    git: hasGitTag(version, gitTags),
+  };
+}
+
+function isIncompleteRelease(version: string, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): boolean {
+  const presence = releasePresence(version, npmVersions, gitTags);
+  return presence.npm !== presence.git;
+}
+
+function isCompletelyReleased(version: string, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): boolean {
+  const presence = releasePresence(version, npmVersions, gitTags);
+  return presence.npm && presence.git;
+}
+
+function stablePart(version: ParsedVersion): string {
+  return `${version.major}.${version.minor}.${version.patch}`;
+}
+
+function devPrereleaseVersion(targetStable: string, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): string {
+  return `${targetStable}-dev.${nextPrereleaseNumber(targetStable, npmVersions, gitTags)}`;
+}
+
+function highestDevStableBase(npmVersions: readonly string[] | string, gitTags: readonly string[] | string): string | null {
+  const bases = [...normalizedNpmVersions(npmVersions), ...normalizedGitTags(gitTags)].flatMap((version) => {
+    const parsed = parseVersion(version);
+    if (!parsed?.prerelease || !DEV_PRERELEASE.test(parsed.prerelease)) return [];
+    return [stablePart(parsed)];
+  });
+  return maxVersion(bases);
+}
+
+function maxStableBase(...versions: Array<string | null | undefined>): string | null {
+  return maxVersion(versions.filter((version): version is string => Boolean(version)));
+}
+
+function incompleteReleaseCandidates(branch: ReleaseBranch, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): string[] {
+  const npmSet = new Set(normalizedNpmVersions(npmVersions));
+  const gitSet = new Set(normalizedGitTags(gitTags));
+  const allVersions = new Set([...npmSet, ...gitSet]);
+  return [...allVersions].filter((version) => {
+    const parsed = parseVersion(version);
+    if (!parsed) return false;
+    if ((npmSet.has(version) && gitSet.has(version)) || (!npmSet.has(version) && !gitSet.has(version))) return false;
+    if (branch === "main") return parsed.prerelease === undefined;
+    return parsed.prerelease !== undefined && DEV_PRERELEASE.test(parsed.prerelease);
+  });
+}
+
+function highestIncompleteReleaseVersion(branch: ReleaseBranch, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): string | null {
+  return maxVersion(incompleteReleaseCandidates(branch, npmVersions, gitTags));
+}
+
+export function computeReleaseVersion({ branch, bump, npmVersions, gitTags, currentVersion }: ReleaseVersionRequest): string {
+  const incompleteVersion = highestIncompleteReleaseVersion(branch, npmVersions, gitTags);
+  if (incompleteVersion) return incompleteVersion;
+  if (bump === "none") return "";
+
   const baseStable = highestStableVersion(npmVersions, gitTags);
   let targetStable = incStable(baseStable, bump);
 
@@ -177,12 +281,48 @@ export function computeReleaseVersion({ branch, bump, npmVersions, gitTags }: Re
     targetStable = compareVersions(targetStable, "1.0.0") < 0 ? "1.0.0" : targetStable;
   }
 
+  const normalizedCurrent = currentVersion ? stripGitTagPrefix(currentVersion.trim()) : undefined;
+  const currentParsed = normalizedCurrent ? parseVersion(normalizedCurrent) : null;
+
   if (branch === "main") {
+    if (normalizedCurrent && currentParsed && !currentParsed.prerelease) {
+      if (isIncompleteRelease(normalizedCurrent, npmVersions, gitTags)) {
+        return normalizedCurrent;
+      }
+      if (!isCompletelyReleased(normalizedCurrent, npmVersions, gitTags) && compareVersions(normalizedCurrent, targetStable) > 0) {
+        return normalizedCurrent;
+      }
+    }
     return targetStable;
   }
 
-  const prereleaseNumber = nextPrereleaseNumber(targetStable, npmVersions, gitTags);
-  return `${targetStable}-dev.${prereleaseNumber}`;
+  const currentStable = currentParsed ? stablePart(currentParsed) : null;
+  const currentDevStable = currentParsed?.prerelease && DEV_PRERELEASE.test(currentParsed.prerelease) ? currentStable : null;
+  const devTargetStable = maxStableBase(targetStable, highestDevStableBase(npmVersions, gitTags), currentDevStable) ?? targetStable;
+  const computedDevVersion = devPrereleaseVersion(devTargetStable, npmVersions, gitTags);
+  if (!normalizedCurrent || !currentParsed) {
+    return computedDevVersion;
+  }
+
+  if (!currentParsed.prerelease) {
+    return !isCompletelyReleased(currentStable, npmVersions, gitTags) && compareVersions(currentStable, devTargetStable) > 0
+      ? devPrereleaseVersion(currentStable, npmVersions, gitTags)
+      : computedDevVersion;
+  }
+
+  if (!DEV_PRERELEASE.test(currentParsed.prerelease)) {
+    return computedDevVersion;
+  }
+
+  if (isIncompleteRelease(normalizedCurrent, npmVersions, gitTags)) {
+    return normalizedCurrent;
+  }
+
+  if (!isCompletelyReleased(normalizedCurrent, npmVersions, gitTags) && compareVersions(normalizedCurrent, computedDevVersion) > 0) {
+    return normalizedCurrent;
+  }
+
+  return computedDevVersion;
 }
 
 export const nextReleaseVersion = computeReleaseVersion;
@@ -192,17 +332,17 @@ function isReleaseBranch(value: string): value is ReleaseBranch {
 }
 
 function isVersionBump(value: string): value is VersionBump {
-  return value === "major" || value === "minor" || value === "patch";
+  return value === "major" || value === "minor" || value === "patch" || value === "none";
 }
 
 function main(argv: string[]): void {
-  const [branch, bump, npmVersions, gitTags] = argv;
+  const [branch, bump, npmVersions, gitTags, currentVersion] = argv;
 
   if (!branch || !bump || !npmVersions || !gitTags || !isReleaseBranch(branch) || !isVersionBump(bump)) {
-    throw new Error("Usage: version-helper <main|dev> <major|minor|patch> <npm-versions> <git-tags>");
+    throw new Error("Usage: version-helper <main|dev> <major|minor|patch|none> <npm-versions> <git-tags> [current-package-version]");
   }
 
-  process.stdout.write(computeReleaseVersion({ branch, bump, npmVersions, gitTags }));
+  process.stdout.write(computeReleaseVersion({ branch, bump, npmVersions, gitTags, currentVersion }));
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {

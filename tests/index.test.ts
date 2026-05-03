@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -103,6 +103,7 @@ function createHarness(options?: {
       : currentCtx.sessionManager?.getEntries?.().slice(entriesBefore) ?? [];
     await agentEnd({ messages }, currentCtx);
   };
+  const exec = options?.exec ?? (async () => ({ killed: false, stdout: "", stderr: "", code: 0 }));
   const pi = {
     on: (eventName: string, handler: (...args: Array<any>) => Promise<any> | any) => {
       eventHandlers.set(eventName, handler);
@@ -115,13 +116,21 @@ function createHarness(options?: {
       options?.appendEntry?.(customType, data);
     },
     sendUserMessage,
-    exec:
-      options?.exec ??
-      (async () => ({
-        killed: false,
-        stdout: "",
-        stderr: "",
-      })),
+    exec,
+    __ralphRunShellCommandBounded: async (command: string, timeoutMs: number, cwd: string | undefined) => {
+      const result = await exec("bash", ["-c", command], { timeout: timeoutMs, cwd });
+      const stdout = result.stdout ?? "";
+      const stderr = result.stderr ?? "";
+      return {
+        stdout,
+        stderr,
+        code: typeof result.code === "number" ? result.code : null,
+        signal: result.signal ?? null,
+        killed: result.killed === true,
+        outputBytes: Buffer.byteLength(stdout + stderr, "utf8"),
+        outputTruncated: false,
+      };
+    },
   } as any;
 
   // Default mock runner that simulates iterations using the test context's
@@ -415,29 +424,19 @@ test("runCommands keeps plain frontmatter commands in the repo cwd", async () =>
   mkdirSync(taskDir, { recursive: true });
   try {
     const originalCwd = process.cwd();
-    const observed: Array<{ tool: string; args: string[]; options?: { cwd?: string }; cwdAtExec: string }> = [];
-    const pi = {
-      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
-        observed.push({ tool, args, options, cwdAtExec: process.cwd() });
-        return { killed: false, stdout: "", stderr: "" };
-      },
-    } as any;
-
-    await runCommands(
+    const outputs = await runCommands(
       [
-        { name: "npm test", run: "npm test", timeout: 1 },
-        { name: "git log", run: "git log --oneline", timeout: 1 },
+        { name: "pwd-a", run: "pwd", timeout: 1 },
+        { name: "pwd-b", run: "pwd", timeout: 1 },
       ],
       [],
-      pi,
+      {} as any,
       {},
       repoCwd,
       taskDir,
     );
 
-    assert.equal(observed.length, 2);
-    assert.deepEqual(observed.map(({ options }) => options?.cwd), [repoCwd, repoCwd]);
-    assert.equal(observed[0].cwdAtExec, originalCwd);
+    assert.deepEqual(outputs.map((output) => output.output), [realpathSync(repoCwd), realpathSync(repoCwd)]);
     assert.equal(process.cwd(), originalCwd);
   } finally {
     rmSync(repoCwd, { recursive: true, force: true });
@@ -450,20 +449,12 @@ test("runCommands runs ./-prefixed frontmatter commands from the task directory"
   mkdirSync(taskDir, { recursive: true });
   try {
     const originalCwd = process.cwd();
-    const observed: Array<{ tool: string; args: string[]; options?: { cwd?: string }; cwdAtExec: string }> = [];
-    const pi = {
-      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
-        observed.push({ tool, args, options, cwdAtExec: process.cwd() });
-        return { killed: false, stdout: "", stderr: "" };
-      },
-    } as any;
+    mkdirSync(join(taskDir, "scripts"), { recursive: true });
+    writeFileSync(join(taskDir, "scripts", "build"), "#!/bin/sh\npwd\n", { mode: 0o755 });
 
-    await runCommands([{ name: "build", run: "  ./scripts/build", timeout: 1 }], [], pi, {}, repoCwd, taskDir);
+    const outputs = await runCommands([{ name: "build", run: "  ./scripts/build", timeout: 1 }], [], {} as any, {}, repoCwd, taskDir);
 
-    assert.equal(observed.length, 1);
-    assert.equal(observed[0].tool, "bash");
-    assert.equal(observed[0].options?.cwd, taskDir);
-    assert.equal(observed[0].cwdAtExec, originalCwd);
+    assert.equal(outputs[0].output, realpathSync(taskDir));
     assert.equal(process.cwd(), originalCwd);
   } finally {
     rmSync(repoCwd, { recursive: true, force: true });
@@ -476,28 +467,19 @@ test("runCommands uses the semantic command form to choose taskDir for templated
   mkdirSync(taskDir, { recursive: true });
   try {
     const originalCwd = process.cwd();
-    const observed: Array<{ tool: string; args: string[]; options?: { cwd?: string }; cwdAtExec: string }> = [];
-    const pi = {
-      exec: async (tool: string, args: string[], options?: { cwd?: string }) => {
-        observed.push({ tool, args, options, cwdAtExec: process.cwd() });
-        return { killed: false, stdout: "", stderr: "" };
-      },
-    } as any;
+    mkdirSync(join(taskDir, "scripts"), { recursive: true });
+    writeFileSync(join(taskDir, "scripts", "check.sh"), "#!/bin/sh\nprintf '%s %s' \"$PWD\" \"$1\"\n", { mode: 0o755 });
 
-    await runCommands(
+    const outputs = await runCommands(
       [{ name: "check", run: "{{ args.tool }} --flag", timeout: 1 }],
       [],
-      pi,
+      {} as any,
       { tool: "./scripts/check.sh" },
       repoCwd,
       taskDir,
     );
 
-    assert.equal(observed.length, 1);
-    assert.equal(observed[0].tool, "bash");
-    assert.equal(observed[0].args[1], "'./scripts/check.sh' --flag");
-    assert.equal(observed[0].options?.cwd, taskDir);
-    assert.equal(observed[0].cwdAtExec, originalCwd);
+    assert.equal(outputs[0].output, `${realpathSync(taskDir)} --flag`);
     assert.equal(process.cwd(), originalCwd);
   } finally {
     rmSync(repoCwd, { recursive: true, force: true });
@@ -537,21 +519,15 @@ test("runCommands suppresses stale blocked-command appendEntry failures", async 
       return true;
     }) as typeof process.stderr.write;
 
-    let execCalls = 0;
     const pi = {
       appendEntry: () => {
         throw new Error("This extension instance is stale after session replacement or reload. Use the provided replacement-session context instead.");
-      },
-      exec: async () => {
-        execCalls += 1;
-        return { killed: false, stdout: "", stderr: "" };
       },
     } as any;
 
     const result = await runCommands([{ name: "blocked", run: "git push origin main", timeout: 1 }], ["git\\s+push"], pi, {}, repoCwd, taskDir);
 
-    assert.deepEqual(result, [{ name: "blocked", output: "[blocked by guardrail: git\\s+push]" }]);
-    assert.equal(execCalls, 0);
+    assert.deepEqual(result, [{ name: "blocked", output: "[blocked by guardrail: git\\s+push]", status: "blocked", blockedPattern: "git\\s+push", command: "git push origin main" }]);
     assert.equal(stderrWrites.some((entry) => entry.toLowerCase().includes("stale")), false);
   } finally {
     process.stderr.write = originalStderrWrite;

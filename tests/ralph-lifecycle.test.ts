@@ -182,7 +182,7 @@ test("/ralph-status reads durable status and last iteration details", async (t) 
   assert.match(harness.notifications[0].message, /startedAt: 2026-04-23T12:00:00\.000Z/);
   assert.match(harness.notifications[0].message, /currentIteration: 3\/3/);
   assert.match(harness.notifications[0].message, /lastUpdate: 2026-04-23T12:05:00\.000Z/);
-  assert.match(harness.notifications[0].message, /lastIteration: #3 durationMs=60000 progress=true completionGate=blocked \(OPEN_QUESTIONS\.md still has P0 items\)/);
+  assert.match(harness.notifications[0].message, /lastIteration: #3 durationMs=60000 progress=true changedFiles=1 noProgressStreak=0 completionGate=blocked \(OPEN_QUESTIONS\.md still has P0 items\)/);
 });
 
 test("/ralph-resume refuses when active and starts when inactive", async (t) => {

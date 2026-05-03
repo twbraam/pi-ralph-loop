@@ -17,6 +17,19 @@ export type RunnerStatus =
 
 export type ProgressState = boolean | "unknown";
 
+export type CommandOutcomeStatus = "ok" | "blocked" | "timeout" | "error";
+
+export type CommandOutcomeRecord = {
+  name: string;
+  status: CommandOutcomeStatus;
+  acceptance?: boolean;
+  blockedPattern?: string;
+  durationMs?: number;
+  outputPreview?: string;
+  outputTruncated?: boolean;
+  outputBytes?: number;
+};
+
 export type CompletionRecord = {
   promiseSeen: boolean;
   durableProgressObserved: boolean;
@@ -24,6 +37,7 @@ export type CompletionRecord = {
   gatePassed: boolean;
   gateBlocked: boolean;
   blockingReasons: string[];
+  acceptanceOutcomes?: CommandOutcomeRecord[];
 };
 
 export type ShellPolicy =
@@ -48,6 +62,7 @@ export type IterationRecord = {
   completionPromiseMatched?: boolean;
   completionGate?: { ready: boolean; reasons: string[] };
   completion?: CompletionRecord;
+  commandOutcomes?: CommandOutcomeRecord[];
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
   loopToken?: string;
@@ -146,6 +161,16 @@ export type CompletionGateBlockedEvent = {
   reasons: string[];
 };
 
+export type CompletionAcceptanceCheckedEvent = {
+  type: "completion.acceptance.checked";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  ready: boolean;
+  reasons: string[];
+  outcomes: CommandOutcomeRecord[];
+};
+
 export type IterationCompletedEvent = {
   type: "iteration.completed";
   timestamp: string;
@@ -158,6 +183,7 @@ export type IterationCompletedEvent = {
   completionPromiseMatched?: boolean;
   completionGate?: { ready: boolean; reasons: string[] };
   completion?: CompletionRecord;
+  commandOutcomes?: CommandOutcomeRecord[];
   snapshotTruncated?: boolean;
   snapshotErrorCount?: number;
   reason?: string;
@@ -183,6 +209,7 @@ export type RunnerEvent =
   | CompletionGateCheckedEvent
   | CompletionGatePassedEvent
   | CompletionGateBlockedEvent
+  | CompletionAcceptanceCheckedEvent
   | RunnerFinishedEvent;
 
 export type RunnerStatusFile = {
@@ -322,6 +349,24 @@ function isProgressState(value: unknown): value is ProgressState {
   return value === true || value === false || value === "unknown";
 }
 
+function isCommandOutcomeRecord(value: unknown): value is CommandOutcomeRecord {
+  if (!isRecord(value)) return false;
+  return (
+    isString(value.name) &&
+    (value.status === "ok" || value.status === "blocked" || value.status === "timeout" || value.status === "error") &&
+    (value.acceptance === undefined || typeof value.acceptance === "boolean") &&
+    (value.blockedPattern === undefined || isString(value.blockedPattern)) &&
+    (value.durationMs === undefined || (isNumber(value.durationMs) && value.durationMs >= 0)) &&
+    (value.outputPreview === undefined || isString(value.outputPreview)) &&
+    (value.outputTruncated === undefined || typeof value.outputTruncated === "boolean") &&
+    (value.outputBytes === undefined || (isNumber(value.outputBytes) && value.outputBytes >= 0))
+  );
+}
+
+function isCommandOutcomeArray(value: unknown): value is CommandOutcomeRecord[] {
+  return Array.isArray(value) && value.every(isCommandOutcomeRecord);
+}
+
 function isGuardrails(value: unknown): value is Guardrails {
   if (!isRecord(value)) return false;
   return isStringArray(value.blockCommands) && isStringArray(value.protectedFiles) && (value.shellPolicy === undefined || isShellPolicy(value.shellPolicy));
@@ -335,7 +380,8 @@ function isCompletionRecord(value: unknown): value is CompletionRecord {
     typeof value.gateChecked === "boolean" &&
     typeof value.gatePassed === "boolean" &&
     typeof value.gateBlocked === "boolean" &&
-    isStringArray(value.blockingReasons)
+    isStringArray(value.blockingReasons) &&
+    (value.acceptanceOutcomes === undefined || isCommandOutcomeArray(value.acceptanceOutcomes))
   );
 }
 
@@ -446,6 +492,16 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         value.ready === false &&
         isStringArray(value.reasons)
       );
+    case "completion.acceptance.checked":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        typeof value.ready === "boolean" &&
+        isStringArray(value.reasons) &&
+        isCommandOutcomeArray(value.outcomes)
+      );
     case "iteration.completed":
       return (
         isNumber(value.iteration) &&
@@ -461,6 +517,7 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         (value.completionPromiseMatched === undefined || typeof value.completionPromiseMatched === "boolean") &&
         (value.completionGate === undefined || isCompletionGate(value.completionGate)) &&
         (value.completion === undefined || isCompletionRecord(value.completion)) &&
+        (value.commandOutcomes === undefined || isCommandOutcomeArray(value.commandOutcomes)) &&
         (value.snapshotTruncated === undefined || typeof value.snapshotTruncated === "boolean") &&
         (value.snapshotErrorCount === undefined || (isNumber(value.snapshotErrorCount) && Number.isInteger(value.snapshotErrorCount) && value.snapshotErrorCount >= 0)) &&
         (value.reason === undefined || isString(value.reason))
@@ -527,6 +584,9 @@ function completionHeaderLines(record: IterationRecord): string[] {
     `- Completion gate checked: ${completion.gateChecked ? "yes" : "no"}`,
     `- Completion gate: ${completion.gateChecked ? (completion.gatePassed ? "passed" : completion.gateBlocked ? "blocked" : "pending") : "not checked"}`,
     `- Blocking reasons: ${completion.blockingReasons.length > 0 ? completion.blockingReasons.join("; ") : "none"}`,
+    ...(completion.acceptanceOutcomes?.length
+      ? [`- Acceptance outcomes: ${completion.acceptanceOutcomes.map((outcome) => `${outcome.name}:${outcome.status}`).join(", ")}`]
+      : []),
   ];
 }
 
@@ -543,9 +603,21 @@ function rpcTelemetryHeaderLines(record: IterationRecord): string[] {
     ...(telemetry.timedOutAt ? [`  - Timed out: ${telemetry.timedOutAt}`] : []),
     ...(telemetry.exitCode !== undefined ? [`  - Exit code: ${String(telemetry.exitCode)}`] : []),
     ...(telemetry.exitSignal !== undefined ? [`  - Exit signal: ${String(telemetry.exitSignal)}`] : []),
-    ...(telemetry.stderrText ? [`  - Stderr: ${telemetry.stderrText.trimEnd()}`] : []),
+    ...(telemetry.stderrText ? [`  - Stderr: ${telemetry.stderrText.trimEnd()}${telemetry.stderrTruncated ? ` [truncated, ${telemetry.stderrBytes ?? "unknown"} bytes total]` : ""}`] : []),
     ...(telemetry.error ? [`  - Error: ${telemetry.error}`] : []),
   ];
+}
+
+const TRANSCRIPT_COMMAND_OUTPUT_MAX_CHARS = 12_000;
+
+function boundedTranscriptCommandOutput(output: string): string {
+  if (output.length <= TRANSCRIPT_COMMAND_OUTPUT_MAX_CHARS) return output;
+  const outputBytes = Buffer.byteLength(output, "utf8");
+  const marker = `\n[ralph: command output truncated after ${TRANSCRIPT_COMMAND_OUTPUT_MAX_CHARS} chars; original ${outputBytes} bytes]\n`;
+  const visibleChars = Math.max(0, TRANSCRIPT_COMMAND_OUTPUT_MAX_CHARS - marker.length);
+  const headChars = Math.floor(visibleChars * 0.7);
+  const tailChars = visibleChars - headChars;
+  return `${output.slice(0, headChars)}${marker}${output.slice(-tailChars)}`;
 }
 
 function transcriptHeaderLines(record: IterationRecord): string[] {
@@ -555,6 +627,7 @@ function transcriptHeaderLines(record: IterationRecord): string[] {
     `- Progress: ${String(record.progress)}`,
     `- Changed files: ${record.changedFiles.length > 0 ? record.changedFiles.join(", ") : "none"}`,
     `- No-progress streak: ${record.noProgressStreak}`,
+    ...(record.commandOutcomes?.length ? [`- Command outcomes: ${record.commandOutcomes.map((outcome) => `${outcome.name}:${outcome.status}`).join(", ")}`] : []),
     ...completionHeaderLines(record),
     ...rpcTelemetryHeaderLines(record),
   ];
@@ -576,7 +649,7 @@ export function writeIterationTranscript(taskDir: string, transcript: IterationT
     lines.push("None.");
   } else {
     for (const output of transcript.commandOutputs) {
-      lines.push(`### ${output.name}`, "", "```text", normalizeTranscriptText(output.output), "```", "");
+      lines.push(`### ${output.name}`, "", "```text", normalizeTranscriptText(boundedTranscriptCommandOutput(output.output)), "```", "");
     }
     lines.pop();
   }

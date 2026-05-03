@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 
-import { ensureRunnerDir, readRunnerEvents, type CompletionRecord, type ProgressState, type RunnerEvent, type RunnerStatus, type RunnerStatusFile } from "../src/runner-state.ts";
+import { ensureRunnerDir, readRunnerEvents, type CommandOutcomeRecord, type CompletionRecord, type ProgressState, type RunnerEvent, type RunnerStatus, type RunnerStatusFile } from "../src/runner-state.ts";
 
 type Guardrails = RunnerStatusFile["guardrails"];
 
@@ -43,6 +43,7 @@ type ExpectedRunnerEvent =
       completionPromiseMatched?: boolean;
       completionGate?: { ready: boolean; reasons: string[] };
       completion?: CompletionRecord;
+      commandOutcomes?: CommandOutcomeRecord[];
       snapshotTruncated?: boolean;
       snapshotErrorCount?: number;
       reason?: string;
@@ -107,6 +108,15 @@ type ExpectedRunnerEvent =
       loopToken: string;
       ready: false;
       reasons: string[];
+    }
+  | {
+      type: "completion.acceptance.checked";
+      timestamp: string;
+      iteration: number;
+      loopToken: string;
+      ready: boolean;
+      reasons: string[];
+      outcomes: CommandOutcomeRecord[];
     }
   | {
       type: "runner.finished";

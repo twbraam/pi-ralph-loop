@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -310,6 +311,117 @@ function validateFrontmatter(fm: Frontmatter, ctx: Pick<CommandContext, "ui">): 
   return true;
 }
 
+const COMMAND_OUTPUT_MAX_CHARS = 12_000;
+
+function byteLength(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+function truncateCommandOutput(output: string, originalBytes?: number, forceTruncated = false): { output: string; outputTruncated?: true; outputBytes?: number } {
+  const outputBytes = originalBytes ?? byteLength(output);
+  if (!forceTruncated && output.length <= COMMAND_OUTPUT_MAX_CHARS) return { output };
+
+  const marker = `\n[ralph: command output truncated after ${COMMAND_OUTPUT_MAX_CHARS} chars; original ${outputBytes} bytes]\n`;
+  const visibleChars = Math.max(0, COMMAND_OUTPUT_MAX_CHARS - marker.length);
+  const headChars = Math.floor(visibleChars * 0.7);
+  const tailChars = visibleChars - headChars;
+  const truncated = [
+    output.slice(0, headChars),
+    marker,
+    output.slice(-tailChars),
+  ].join("");
+  return { output: truncated, outputTruncated: true, outputBytes };
+}
+
+function commandOutputWithMetadata(output: string, extra: Omit<CommandOutput, "output" | "outputBytes" | "outputTruncated">, outputBytes?: number, forceTruncated = false): CommandOutput {
+  const capped = truncateCommandOutput(output, outputBytes, forceTruncated);
+  return { ...extra, ...capped };
+}
+
+type BoundedCommandResult = {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  signal?: NodeJS.Signals | null;
+  killed: boolean;
+  outputBytes: number;
+  outputTruncated: boolean;
+};
+
+type BoundedCommandExecutor = (command: string, timeoutMs: number, cwd: string | undefined) => Promise<BoundedCommandResult>;
+
+function injectedBoundedCommandExecutor(pi: unknown): BoundedCommandExecutor | undefined {
+  const maybe = pi as { __ralphRunShellCommandBounded?: unknown };
+  return typeof maybe.__ralphRunShellCommandBounded === "function" ? maybe.__ralphRunShellCommandBounded as BoundedCommandExecutor : undefined;
+}
+
+function runShellCommandBounded(command: string, timeoutMs: number, cwd: string | undefined): Promise<BoundedCommandResult> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const useProcessGroup = process.platform !== "win32";
+    const child = spawn("bash", ["-c", command], { cwd, stdio: ["ignore", "pipe", "pipe"], detached: useProcessGroup });
+    let stdout = "";
+    let stderr = "";
+    let outputBytes = 0;
+    let capturedChars = 0;
+    let outputTruncated = false;
+    let settled = false;
+
+    const append = (stream: "stdout" | "stderr", chunk: Buffer): void => {
+      const text = chunk.toString("utf8");
+      outputBytes += chunk.length;
+      if (capturedChars >= COMMAND_OUTPUT_MAX_CHARS) {
+        outputTruncated = true;
+        return;
+      }
+      const remaining = COMMAND_OUTPUT_MAX_CHARS - capturedChars;
+      const slice = text.slice(0, remaining);
+      capturedChars += slice.length;
+      if (stream === "stdout") stdout += slice;
+      else stderr += slice;
+      if (text.length > remaining) outputTruncated = true;
+    };
+
+    const finish = (result: BoundedCommandResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolvePromise(result);
+    };
+
+    const killCommandTree = (): void => {
+      try {
+        if (useProcessGroup && child.pid !== undefined) {
+          process.kill(-child.pid, "SIGKILL");
+        } else {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already exited
+        }
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      killCommandTree();
+      finish({ stdout, stderr, code: null, signal: "SIGKILL", killed: true, outputBytes, outputTruncated });
+    }, timeoutMs);
+
+    child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
+    child.on("error", (error) => {
+      if (settled) return;
+      clearTimeout(timeout);
+      rejectPromise(error);
+    });
+    child.on("close", (code, signal) => {
+      finish({ stdout, stderr, code, signal, killed: false, outputBytes, outputTruncated });
+    });
+  });
+}
+
 export async function runCommands(
   commands: CommandDef[],
   guardrailsOrBlockPatterns: Frontmatter["guardrails"] | string[],
@@ -322,12 +434,18 @@ export async function runCommands(
   const guardrails: Frontmatter["guardrails"] = Array.isArray(guardrailsOrBlockPatterns)
     ? { blockCommands: guardrailsOrBlockPatterns, protectedFiles: [] }
     : guardrailsOrBlockPatterns;
+  const executeCommand = injectedBoundedCommandExecutor(pi) ?? runShellCommandBounded;
   const results: CommandOutput[] = [];
   for (const cmd of commands) {
     const semanticRun = replaceArgsPlaceholders(cmd.run, runtimeArgs);
     const shellPolicyBlocked = findShellPolicyBlockedCommandPattern(semanticRun, guardrails.shellPolicy);
     const blockedPattern = shellPolicyBlocked ?? findBlockedCommandPattern(semanticRun, guardrails.blockCommands);
     const resolvedRun = resolveCommandRun(cmd.run, runtimeArgs);
+    const baseOutput = {
+      name: cmd.name,
+      command: semanticRun,
+      ...(cmd.acceptance ? { acceptance: true } : {}),
+    } satisfies Partial<CommandOutput> & { name: string; command: string };
     if (blockedPattern) {
       try {
         pi.appendEntry?.("ralph-blocked-command", { name: cmd.name, command: semanticRun, blockedPattern, cwd: repoCwd, taskDir });
@@ -336,22 +454,49 @@ export async function runCommands(
           throw err;
         }
       }
-      results.push({ name: cmd.name, output: `[blocked by guardrail: ${blockedPattern}]` });
+      results.push(commandOutputWithMetadata(`[blocked by guardrail: ${blockedPattern}]`, {
+        ...baseOutput,
+        status: "blocked",
+        blockedPattern,
+      }));
       continue;
     }
 
     const commandCwd = semanticRun.trim().startsWith("./") ? taskDir ?? repoCwd : repoCwd;
 
     try {
-      const result = await pi.exec("bash", ["-c", resolvedRun], { timeout: cmd.timeout * 1000, cwd: commandCwd });
+      const result = await executeCommand(resolvedRun, cmd.timeout * 1000, commandCwd);
+      const output = (result.stdout + result.stderr).trim();
+      const exitCode = typeof result.code === "number" ? result.code : 0;
+      const signal = result.signal ?? (result.code === null ? "unknown" : undefined);
       results.push(
         result.killed
-          ? { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` }
-          : { name: cmd.name, output: (result.stdout + result.stderr).trim() },
+          ? commandOutputWithMetadata(`[timed out after ${cmd.timeout}s]`, {
+              ...baseOutput,
+              status: "timeout",
+              timedOut: true,
+            }, result.outputBytes, result.outputTruncated)
+          : signal
+            ? commandOutputWithMetadata(output ? `[signal ${signal}]\n${output}` : `[signal ${signal}]`, {
+                ...baseOutput,
+                status: "error",
+              }, result.outputBytes, result.outputTruncated)
+            : exitCode !== 0
+              ? commandOutputWithMetadata(output ? `[exit ${exitCode}]\n${output}` : `[exit ${exitCode}]`, {
+                  ...baseOutput,
+                  status: "error",
+                }, result.outputBytes, result.outputTruncated)
+              : commandOutputWithMetadata(output, {
+                  ...baseOutput,
+                  status: "ok",
+                }, result.outputBytes, result.outputTruncated),
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      results.push({ name: cmd.name, output: `[error: ${message}]` });
+      results.push(commandOutputWithMetadata(`[error: ${message}]`, {
+        ...baseOutput,
+        status: "error",
+      }));
     }
   }
   return results;
@@ -1020,6 +1165,14 @@ function summarizeIterationRecord(record: IterationRecord): string {
     parts.push(`durationMs=${record.durationMs}`);
   }
   parts.push(`progress=${record.progress}`);
+  parts.push(`changedFiles=${record.changedFiles.length}`);
+  parts.push(`noProgressStreak=${record.noProgressStreak}`);
+  if (record.commandOutcomes?.length) {
+    parts.push(`commands=${record.commandOutcomes.map((outcome) => `${outcome.name}:${outcome.status}`).join(",")}`);
+  }
+  if (record.completion?.acceptanceOutcomes?.length) {
+    parts.push(`acceptance=${record.completion.acceptanceOutcomes.map((outcome) => `${outcome.name}:${outcome.status}`).join(",")}`);
+  }
   if (record.completionGate) {
     const gateStatus = record.completionGate.ready
       ? "ready"

@@ -454,6 +454,26 @@ test("writeIterationTranscript writes a human-reviewable markdown transcript", (
   }
 });
 
+test("writeIterationTranscript caps oversized command output", () => {
+  const taskDir = createTempDir();
+  try {
+    const largeOutput = "x".repeat(20_000);
+    const transcriptPath = writeIterationTranscript(taskDir, {
+      record: makeIterationRecord({ iteration: 1, status: "complete" }),
+      prompt: "Rendered prompt",
+      commandOutputs: [{ name: "logs", output: largeOutput }],
+      assistantText: "Done.",
+    });
+
+    const raw = readFileSync(transcriptPath, "utf8");
+    assert.ok(raw.length < largeOutput.length + 1000);
+    assert.ok(raw.includes("command output truncated"));
+    assert.ok(raw.includes("original 20000 bytes"));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("active loop registry prunes stale entries and preserves fresh ones", () => {
   const cwd = createTempDir();
   try {

@@ -13,7 +13,7 @@ export type RpcSubprocessConfig = {
   prompt: string;
   cwd: string;
   timeoutMs: number;
-  /** Optional timeout for the handshake acks before the prompt is sent. Defaults to 5000. */
+  /** Optional timeout for the handshake acks before the prompt is sent. Defaults to 15000. */
   handshakeTimeoutMs?: number;
   /** Override the spawn command for testing. Defaults to "pi" */
   spawnCommand?: string;
@@ -36,9 +36,8 @@ export type RpcSubprocessConfig = {
   thinkingLevel?: string;
   /** Callback for observing events as they stream */
   onEvent?: (event: RpcEvent) => void;
-  /** AbortSignal for cooperative cancellation. On abort, the direct child process is SIGKILLed.
-   *  Grandchild processes may survive — the caller is responsible for process group cleanup
-   *  if full-tree termination is required. */
+  /** AbortSignal for cooperative cancellation. On abort, the RPC subprocess tree is SIGKILLed on Unix.
+   *  Windows falls back to direct-child termination. */
   signal?: AbortSignal;
 };
 
@@ -53,6 +52,9 @@ export type RpcTelemetry = {
   exitCode?: number | null;
   exitSignal?: NodeJS.Signals | null;
   stderrText?: string;
+  stderrTruncated?: boolean;
+  stderrBytes?: number;
+  stdoutBufferBytes?: number;
   error?: string;
 };
 
@@ -121,12 +123,30 @@ function extractAssistantText(messages: unknown[]): string {
 
 // --- RPC Subprocess Execution ---
 
+const DETACHED_RPC_PROCESS_GROUP = process.platform !== "win32";
+
+function killRpcSubprocessTree(childProcess: ReturnType<typeof spawn>, signal: NodeJS.Signals = "SIGKILL"): void {
+  if (DETACHED_RPC_PROCESS_GROUP && typeof childProcess.pid === "number") {
+    try {
+      process.kill(-childProcess.pid, signal);
+      return;
+    } catch {
+      // Fall back to direct-child termination below.
+    }
+  }
+  try {
+    childProcess.kill(signal);
+  } catch {
+    // Process may already be dead.
+  }
+}
+
 export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcSubprocessResult> {
   const {
     prompt,
     cwd,
     timeoutMs,
-    handshakeTimeoutMs = 5000,
+    handshakeTimeoutMs = 15_000,
     spawnCommand = "pi",
     spawnArgs,
     env,
@@ -167,11 +187,30 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
 
   let childProcess: ReturnType<typeof spawn>;
   let stderrText = "";
+  let stderrBytes = 0;
+  let stderrTruncated = false;
+  const STDERR_TEXT_MAX_CHARS = 4000;
+  const STDOUT_LINE_MAX_CHARS = 1_000_000;
+  const appendStderr = (text: string): void => {
+    stderrBytes += Buffer.byteLength(text, "utf8");
+    if (stderrText.length >= STDERR_TEXT_MAX_CHARS) {
+      stderrTruncated = true;
+      return;
+    }
+    const remaining = STDERR_TEXT_MAX_CHARS - stderrText.length;
+    stderrText += text.slice(0, remaining);
+    if (text.length > remaining) {
+      stderrTruncated = true;
+    }
+  };
   const buildResult = (result: Omit<RpcSubprocessResult, "telemetry">): RpcSubprocessResult => ({
     ...result,
     telemetry: {
       ...telemetry,
       ...(stderrText ? { stderrText } : {}),
+      ...(stderrBytes > 0 ? { stderrBytes } : {}),
+      ...(stderrTruncated ? { stderrTruncated: true } : {}),
+      ...(telemetry.stdoutBufferBytes !== undefined ? { stdoutBufferBytes: telemetry.stdoutBufferBytes } : {}),
     },
   });
 
@@ -180,6 +219,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       cwd,
       env: subprocessEnv,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: DETACHED_RPC_PROCESS_GROUP,
     });
   } catch (err) {
     telemetry.error = err instanceof Error ? err.message : String(err);
@@ -219,11 +259,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       if (settled) return;
       settled = true;
       telemetry.error = "cancelled";
-      try {
-        childProcess.kill("SIGKILL");
-      } catch {
-        // process may already be dead
-      }
+      killRpcSubprocessTree(childProcess, "SIGKILL");
       clearTimeout(timeout);
       clearTimeout(handshakeTimeout);
       resolve(buildResult({
@@ -246,11 +282,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       if (settled) return;
       settled = true;
       telemetry.timedOutAt = nowIso();
-      try {
-        childProcess.kill("SIGKILL");
-      } catch {
-        // process may already be dead
-      }
+      killRpcSubprocessTree(childProcess, "SIGKILL");
       resolve(buildResult({
         success: false,
         lastAssistantText,
@@ -279,28 +311,44 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       if (settled) return;
       settled = true;
       cleanup();
-      // Kill subprocess if still running
-      try {
-        childProcess.kill();
-      } catch {
-        // already dead
-      }
+      // Kill subprocess if still running.
+      killRpcSubprocessTree(childProcess, "SIGKILL");
       resolve(result);
     };
 
     // Set up stderr collection
     childProcess.stderr?.on("data", (data: Buffer) => {
-      stderrText += data.toString("utf8");
+      appendStderr(data.toString("utf8"));
     });
 
     // Set up stdout line reader
     let stdoutBuffer = "";
+    const failStdoutBufferLimit = () => {
+      const stdoutBufferBytes = Buffer.byteLength(stdoutBuffer, "utf8");
+      stdoutBuffer = "";
+      telemetry.stdoutBufferBytes = stdoutBufferBytes;
+      const error = `RPC stdout line exceeded ${STDOUT_LINE_MAX_CHARS} chars before newline (${stdoutBufferBytes} bytes buffered)`;
+      telemetry.error = error;
+      killRpcSubprocessTree(childProcess, "SIGKILL");
+      settle(buildResult({
+        success: false,
+        lastAssistantText,
+        agentEndMessages,
+        timedOut: false,
+        error,
+      }));
+    };
     childProcess.stdout?.on("data", (data: Buffer) => {
+      if (settled) return;
       stdoutBuffer += data.toString("utf8");
 
       // Parse complete lines
       let newlineIndex: number;
       while ((newlineIndex = stdoutBuffer.indexOf("\n")) !== -1) {
+        if (newlineIndex > STDOUT_LINE_MAX_CHARS) {
+          failStdoutBufferLimit();
+          return;
+        }
         const line = stdoutBuffer.slice(0, newlineIndex);
         stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
 
@@ -313,12 +361,33 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
         onEvent?.(event);
 
         if (event.type === "response") {
-          const resp = event as { command?: string; success?: boolean };
+          const resp = event as { command?: string; success?: boolean; error?: unknown };
+          if (resp.command === "set_model" && resp.success === false) {
+            const error = `set_model failed${resp.error ? `: ${String(resp.error)}` : ""}`;
+            telemetry.error = error;
+            settle(buildResult({
+              success: false,
+              lastAssistantText,
+              agentEndMessages,
+              timedOut: false,
+              error,
+            }));
+            return;
+          }
+          if (resp.command === "set_thinking_level" && resp.success === false) {
+            const error = `set_thinking_level failed${resp.error ? `: ${String(resp.error)}` : ""}`;
+            telemetry.error = error;
+            settle(buildResult({
+              success: false,
+              lastAssistantText,
+              agentEndMessages,
+              timedOut: false,
+              error,
+            }));
+            return;
+          }
           if (resp.command === "set_model" && resp.success === true) {
             modelSetAcknowledged = true;
-            if (requiresModelHandshake && requiresThinkingHandshake && !modelSetAcknowledged) {
-              // no-op; handled below
-            }
           }
           if (resp.command === "set_thinking_level" && resp.success === true) {
             thinkingLevelAcknowledged = true;
@@ -342,6 +411,10 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
           endStdin();
           continue;
         }
+      }
+
+      if (stdoutBuffer.length > STDOUT_LINE_MAX_CHARS) {
+        failStdoutBufferLimit();
       }
     });
 
@@ -433,11 +506,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
           : `RPC handshake timed out waiting for ${missing.join(" and ")} acknowledgements`;
       telemetry.error = error;
       settled = true;
-      try {
-        childProcess.kill("SIGKILL");
-      } catch {
-        // process may already be dead
-      }
+      killRpcSubprocessTree(childProcess, "SIGKILL");
       clearTimeout(timeout);
       clearTimeout(handshakeTimeout);
       resolve(buildResult({

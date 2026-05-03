@@ -42,46 +42,146 @@ jobs:
       - name: Determine version bump
         id: bump
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          branch="${GITHUB_REF_NAME}"
+          npm_versions="$(npm view @lnilluv/pi-ralph-loop versions --json)"
+          git_tags="$(git tag --list)"
+          current_version="$(node -p "require('./package.json').version")"
+
+          npm_has_version() {
+            NPM_VERSIONS="$npm_versions" NEW_VERSION="$1" node --input-type=module -e 'const input = process.env.NPM_VERSIONS ?? ""; let versions = []; try { const parsed = JSON.parse(input); versions = Array.isArray(parsed) ? parsed : [parsed]; } catch { versions = input.split(/[\\r\\n,]+/); } console.log(versions.map(String).map((v) => v.trim()).includes(process.env.NEW_VERSION ?? "") ? "true" : "false");'
+          }
+
+          git_has_tag() {
+            if git rev-parse -q --verify "refs/tags/v${1}" >/dev/null; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          write_release_outputs() {
+            local release_bump="$1"
+            local release_version="$2"
+            local update_package="${3:-true}"
+            local repair_kind="${4:-fresh}"
+            if [ "$branch" = "main" ] && [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Main releases must use stable semver, got ${release_version}." >&2
+              exit 1
+            fi
+            if [ "$branch" = "dev" ] && [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]]; then
+              echo "Dev releases must use dev prerelease semver, got ${release_version}." >&2
+              exit 1
+            fi
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "bump=$release_bump" >> "$GITHUB_OUTPUT"
+            echo "new_version=$release_version" >> "$GITHUB_OUTPUT"
+            echo "npm_has_version=$(npm_has_version "$release_version")" >> "$GITHUB_OUTPUT"
+            echo "git_has_tag=$(git_has_tag "$release_version")" >> "$GITHUB_OUTPUT"
+            echo "update_package=$update_package" >> "$GITHUB_OUTPUT"
+            echo "repair_kind=$repair_kind" >> "$GITHUB_OUTPUT"
+          }
+
+          repair_version="$(node --experimental-strip-types ./scripts/version-helper.ts "$branch" none "$npm_versions" "$git_tags" "$current_version")"
+          if [ -n "$repair_version" ]; then
+            repair_npm_has="$(npm_has_version "$repair_version")"
+            repair_git_has="$(git_has_tag "$repair_version")"
+            if [ "$repair_npm_has" = "true" ] && [ "$repair_git_has" = "false" ]; then
+              write_release_outputs "repair" "$repair_version" "false" "tag_missing"
+            elif [ "$repair_npm_has" = "false" ] && [ "$repair_git_has" = "true" ]; then
+              write_release_outputs "repair" "$repair_version" "false" "npm_missing"
+            else
+              echo "Repair version v${repair_version} is not an npm/tag incomplete release." >&2
+              exit 1
+            fi
+            echo "Repairing incomplete release v${repair_version}."
+            exit 0
+          fi
+
+          if [ "$branch" = "main" ]; then
+            last_tag=""
+            while IFS= read -r candidate_tag; do
+              if [ -n "$candidate_tag" ] && [ "$(npm_has_version "${candidate_tag#v}")" = "true" ]; then
+                last_tag="$candidate_tag"
+                break
+              fi
+            done < <(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          else
+            last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          fi
           if [ -n "$last_tag" ]; then
             range="${last_tag}..HEAD"
           else
             range="HEAD"
           fi
 
-          subjects="$(git log --format=%s $range)"
-          bodies="$(git log --format=%b $range)"
+          has_major="false"
+          has_minor="false"
+          has_patch="false"
+          while IFS= read -r commit; do
+            [ -n "$commit" ] || continue
+            subject="$(git log -1 --format=%s "$commit")"
+            body="$(git log -1 --format=%b "$commit")"
+            if printf '%s\n' "$subject" | grep -Eq '^(feat|fix)(\(.+\))?!:'; then
+              has_major="true"
+              continue
+            fi
+            if printf '%s\n' "$subject" | grep -Eq '^(feat|fix)(\(.+\))?:' && printf '%s\n' "$body" | grep -Eq '^BREAKING[ -]CHANGE:'; then
+              has_major="true"
+              continue
+            fi
+            if printf '%s\n' "$subject" | grep -Eq '^feat(\(.+\))?:'; then
+              has_minor="true"
+            elif printf '%s\n' "$subject" | grep -Eq '^fix(\(.+\))?:'; then
+              has_patch="true"
+            fi
+          done < <(git log --format=%H $range)
 
           bump=""
-          if echo "$subjects" | grep -Eq '^(feat|fix)!:' || echo "$bodies" | grep -q 'BREAKING CHANGE'; then
+          if [ "$has_major" = "true" ]; then
             bump="major"
-          elif echo "$subjects" | grep -Eq '^feat(\(.+\))?:'; then
+          elif [ "$has_minor" = "true" ]; then
             bump="minor"
-          elif echo "$subjects" | grep -Eq '^fix(\(.+\))?:'; then
+          elif [ "$has_patch" = "true" ]; then
             bump="patch"
           fi
 
           if [ -z "$bump" ]; then
+            can_repair_github_release="false"
+            if [ "$branch" = "main" ] && [[ "$last_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              can_repair_github_release="true"
+            elif [ "$branch" = "dev" ] && [[ "$last_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]]; then
+              can_repair_github_release="true"
+            fi
+            if [ "$can_repair_github_release" = "true" ] && ! gh release view "$last_tag" >/dev/null 2>&1; then
+              write_release_outputs "release" "${last_tag#v}" "false" "github_release"
+              echo "Repairing missing GitHub Release for ${last_tag}."
+              exit 0
+            fi
             echo "should_release=false" >> "$GITHUB_OUTPUT"
             echo "No feat/fix commits found since ${last_tag:-repository start}; skipping release."
             exit 0
           fi
 
-          branch="${GITHUB_REF_NAME}"
-          npm_versions="$(npm view @lnilluv/pi-ralph-loop versions --json)"
-          git_tags="$(git tag --list)"
-          new_version="$(node --experimental-strip-types ./scripts/version-helper.ts "$branch" "$bump" "$npm_versions" "$git_tags")"
-
-          echo "should_release=true" >> "$GITHUB_OUTPUT"
-          echo "bump=$bump" >> "$GITHUB_OUTPUT"
-          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+          new_version="$(node --experimental-strip-types ./scripts/version-helper.ts "$branch" "$bump" "$npm_versions" "$git_tags" "$current_version")"
+          write_release_outputs "$bump" "$new_version" "true" "fresh"
 
       - name: Bump version
-        if: steps.bump.outputs.should_release == 'true'
-        run: npm version ${{ steps.bump.outputs.new_version }} --no-git-tag-version
+        if: steps.bump.outputs.should_release == 'true' && steps.bump.outputs.update_package != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_version="$(node -p "require('./package.json').version")"
+          new_version="${{ steps.bump.outputs.new_version }}"
+          if [ "$current_version" = "$new_version" ]; then
+            echo "Package files already at v${new_version}; skipping npm version."
+          else
+            npm version "$new_version" --no-git-tag-version
+          fi
 
       - name: Capture version tag
         if: steps.bump.outputs.should_release == 'true'
@@ -89,34 +189,90 @@ jobs:
         run: |
           echo "tag=v${{ steps.bump.outputs.new_version }}" >> "$GITHUB_OUTPUT"
 
-      - name: Publish (main)
-        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
-        run: npx -y npm@11.12.1 publish --access public --provenance
-
-      - name: Publish (dev prerelease)
-        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
-        run: npx -y npm@11.12.1 publish --access public --provenance --tag dev
+      - name: Prepare npm repair checkout
+        if: steps.bump.outputs.should_release == 'true' && steps.bump.outputs.repair_kind == 'npm_missing'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.bump.outputs.new_version }}"
+          git checkout --detach "v${VERSION}"
+          actual_version="$(node -p "require('./package.json').version")"
+          if [ "$actual_version" != "$VERSION" ]; then
+            echo "Tag v${VERSION} has package.json version ${actual_version}; refusing to publish repair." >&2
+            exit 1
+          fi
 
       - name: Commit version bump and tag
-        if: steps.bump.outputs.should_release == 'true'
+        if: steps.bump.outputs.should_release == 'true' && steps.bump.outputs.update_package != 'false'
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION="${{ steps.bump.outputs.new_version }}"
           git add package.json package-lock.json
-          git commit -m "chore(release): v${VERSION}"
-          git tag "v${VERSION}"
-          git push
-          git push --tags
+          if git diff --cached --quiet; then
+            echo "No package version changes to commit."
+          else
+            git commit -m "chore(release): v${VERSION}"
+            git push
+          fi
+          if [ "${{ steps.bump.outputs.git_has_tag }}" = "true" ]; then
+            echo "Tag v${VERSION} already exists; skipping tag push."
+          else
+            git tag "v${VERSION}"
+            git push origin "refs/tags/v${VERSION}"
+          fi
+
+      - name: Repair missing git tag
+        if: steps.bump.outputs.should_release == 'true' && steps.bump.outputs.repair_kind == 'tag_missing'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.bump.outputs.new_version }}"
+          git_head="$(npm view "@lnilluv/pi-ralph-loop@${VERSION}" gitHead --json | node -e 'const fs = require("node:fs"); const raw = fs.readFileSync(0, "utf8").trim(); const value = raw ? JSON.parse(raw) : ""; if (typeof value === "string") process.stdout.write(value.trim());')"
+          if [[ ! "$git_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Published package v${VERSION} does not expose a valid gitHead; manual tag repair required." >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${git_head}^{commit}" 2>/dev/null; then
+            echo "Published gitHead ${git_head} is not available in this checkout; manual tag repair required." >&2
+            exit 1
+          fi
+          actual_version="$(git show "${git_head}:package.json" | node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(0, "utf8")).version ?? "");')"
+          if [ "$actual_version" != "$VERSION" ]; then
+            echo "Published gitHead ${git_head} has package.json version ${actual_version}; refusing to tag v${VERSION}." >&2
+            exit 1
+          fi
+          git tag "v${VERSION}" "$git_head"
+          git push origin "refs/tags/v${VERSION}"
+
+      - name: Publish (main)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main' && steps.bump.outputs.npm_has_version != 'true' && steps.bump.outputs.repair_kind != 'tag_missing' && steps.bump.outputs.repair_kind != 'github_release'
+        run: npx -y npm@11.12.1 publish --access public --provenance
+
+      - name: Publish (dev prerelease)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev' && steps.bump.outputs.npm_has_version != 'true' && steps.bump.outputs.repair_kind != 'tag_missing' && steps.bump.outputs.repair_kind != 'github_release' && contains(steps.bump.outputs.new_version, '-dev.')
+        run: npx -y npm@11.12.1 publish --access public --provenance --tag dev
 
       - name: Create GitHub Release (main)
         if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
-        run: gh release create "${{ steps.version.outputs.tag }}" --generate-notes
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "GitHub Release ${{ steps.version.outputs.tag }} already exists."
+          else
+            gh release create "${{ steps.version.outputs.tag }}" --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Create GitHub Release (dev prerelease)
-        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
-        run: gh release create "${{ steps.version.outputs.tag }}" --prerelease --generate-notes
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev' && contains(steps.bump.outputs.new_version, '-dev.')
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "GitHub Release ${{ steps.version.outputs.tag }} already exists."
+          else
+            gh release create "${{ steps.version.outputs.tag }}" --prerelease --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ github.token }}

@@ -15,6 +15,7 @@ import {
 } from "./ralph.ts";
 import { runCommands } from "./index.ts";
 import {
+  type CommandOutcomeRecord,
   type CompletionRecord,
   type IterationRecord,
   type ProgressState,
@@ -322,6 +323,37 @@ export function summarizeChangedFiles(changedFiles: string[]): string {
   return `${visible.join(", ")} (+${changedFiles.length - visible.length} more)`;
 }
 
+const COMMAND_OUTPUT_PREVIEW_MAX_CHARS = 500;
+
+function previewCommandOutput(output: string): string {
+  if (output.length <= COMMAND_OUTPUT_PREVIEW_MAX_CHARS) return output;
+  const headLength = Math.floor((COMMAND_OUTPUT_PREVIEW_MAX_CHARS - 32) / 2);
+  const tailLength = COMMAND_OUTPUT_PREVIEW_MAX_CHARS - 32 - headLength;
+  return `${output.slice(0, headLength)}\n...[truncated]...\n${output.slice(output.length - tailLength)}`;
+}
+
+function commandOutcomeRecords(outputs: CommandOutput[]): CommandOutcomeRecord[] {
+  return outputs.map((output) => {
+    const record: CommandOutcomeRecord = {
+      name: output.name,
+      status: output.status ?? "ok",
+      ...(output.acceptance ? { acceptance: true } : {}),
+      ...(output.blockedPattern ? { blockedPattern: output.blockedPattern } : {}),
+      ...(typeof output.durationMs === "number" ? { durationMs: output.durationMs } : {}),
+      ...(output.outputTruncated ? { outputTruncated: true } : {}),
+      ...(typeof output.outputBytes === "number" ? { outputBytes: output.outputBytes } : {}),
+      outputPreview: previewCommandOutput(output.output),
+    };
+    return record;
+  });
+}
+
+function acceptanceFailureReasons(outcomes: CommandOutcomeRecord[]): string[] {
+  return outcomes
+    .filter((outcome) => outcome.status !== "ok")
+    .map((outcome) => `Acceptance command failed: ${outcome.name} (${outcome.status})`);
+}
+
 export type CompletionReadiness = {
   ready: boolean;
   reasons: string[];
@@ -577,6 +609,8 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       const commandsOutput: CommandOutput[] = runCommandsFn && pi
         ? await runCommandsFn(fm.commands, currentGuardrails, pi, cwd, taskDir)
         : [];
+      const commandOutcomes = commandOutcomeRecords(commandsOutput);
+      const nonEmptyCommandOutcomes = commandOutcomes.length > 0 ? commandOutcomes : undefined;
 
       // Before snapshot
       const snapshotBefore = captureTaskDirectorySnapshot(ralphPath);
@@ -652,7 +686,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         clearInterval(cancelPollInterval);
       }
 
-      const iterEndMs = Date.now();
+      let iterEndMs = Date.now();
 
       if (rpcResult.cancelled) {
         const iterRecord: IterationRecord = {
@@ -664,6 +698,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           progress: false,
           changedFiles: [],
           noProgressStreak: noProgressStreak + 1,
+          commandOutcomes: nonEmptyCommandOutcomes,
           loopToken,
           rpcTelemetry: rpcResult.telemetry,
         };
@@ -679,6 +714,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           progress: iterRecord.progress,
           changedFiles: [],
           noProgressStreak: iterRecord.noProgressStreak,
+          ...(iterRecord.commandOutcomes ? { commandOutcomes: iterRecord.commandOutcomes } : {}),
           reason: "operator-cancel",
         });
         recordActiveLoopStopObservation(cwd, taskDir, new Date().toISOString());
@@ -700,6 +736,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           changedFiles: [],
           noProgressStreak: noProgressStreak + 1,
           completion: completionRecord,
+          commandOutcomes: nonEmptyCommandOutcomes,
           loopToken,
           rpcTelemetry: rpcResult.telemetry,
         };
@@ -722,6 +759,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           changedFiles: iterRecord.changedFiles,
           noProgressStreak: iterRecord.noProgressStreak,
           completion: iterRecord.completion,
+          ...(iterRecord.commandOutcomes ? { commandOutcomes: iterRecord.commandOutcomes } : {}),
           reason: rpcResult.timedOut ? "rpc-timeout" : "rpc-error",
         });
 
@@ -852,6 +890,41 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       let completionGate: CompletionReadiness | undefined;
       if (completionPromiseMatched && currentCompletionGateMode !== "disabled") {
         completionGate = validateCompletionReadiness(taskDir, currentRequiredOutputs);
+        const acceptanceCommands = fm.commands.filter((command) => command.acceptance === true);
+        if (completionGate.ready && currentCompletionGateMode === "required" && acceptanceCommands.length > 0) {
+          if (!runCommandsFn || !pi) {
+            completionGate = { ready: false, reasons: ["Acceptance commands could not be run: executor unavailable"] };
+            logRunnerEvent(taskDir, {
+              type: "completion.acceptance.checked",
+              timestamp: new Date().toISOString(),
+              iteration: i,
+              loopToken,
+              ready: false,
+              reasons: completionGate.reasons,
+              outcomes: [],
+            });
+          } else {
+            const acceptanceOutputs = await runCommandsFn(acceptanceCommands, currentGuardrails, pi, cwd, taskDir);
+            iterEndMs = Date.now();
+            const acceptanceOutcomes = commandOutcomeRecords(acceptanceOutputs.map((output) => ({ ...output, acceptance: true })));
+            const acceptanceReasons = acceptanceFailureReasons(acceptanceOutcomes);
+            if (completionRecord) {
+              completionRecord.acceptanceOutcomes = acceptanceOutcomes;
+            }
+            logRunnerEvent(taskDir, {
+              type: "completion.acceptance.checked",
+              timestamp: new Date(iterEndMs).toISOString(),
+              iteration: i,
+              loopToken,
+              ready: acceptanceReasons.length === 0,
+              reasons: acceptanceReasons,
+              outcomes: acceptanceOutcomes,
+            });
+            if (acceptanceReasons.length > 0) {
+              completionGate = { ready: false, reasons: acceptanceReasons };
+            }
+          }
+        }
         if (completionRecord) {
           completionRecord.gateChecked = true;
           completionRecord.gatePassed = completionGate.ready;
@@ -910,6 +983,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         completionPromiseMatched: completionPromiseMatched || undefined,
         completionGate,
         completion: completionRecord,
+        commandOutcomes: nonEmptyCommandOutcomes,
         snapshotTruncated,
         snapshotErrorCount,
         rpcTelemetry: rpcResult.telemetry,
@@ -929,6 +1003,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         completionPromiseMatched: iterRecord.completionPromiseMatched,
         completionGate: iterRecord.completionGate,
         completion: iterRecord.completion,
+        ...(iterRecord.commandOutcomes ? { commandOutcomes: iterRecord.commandOutcomes } : {}),
         snapshotTruncated: iterRecord.snapshotTruncated,
         snapshotErrorCount: iterRecord.snapshotErrorCount,
       });

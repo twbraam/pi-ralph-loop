@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -80,6 +80,59 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.ok(result.telemetry.exitedAt);
     assert.equal(result.telemetry.timedOutAt, undefined);
     assert.match(result.telemetry.stderrText ?? "", /mock stderr/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration caps stderr telemetry", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const longStderr = "secret-like-output-".repeat(400);
+    const mockScript = await writeMockScript(cwd, "mock-pi-long-stderr.sh", `#!/bin/bash
+read line
+printf '%s' '${longStderr}' >&2
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.telemetry.stderrTruncated, true);
+    assert.ok((result.telemetry.stderrBytes ?? 0) > 4000);
+    assert.ok((result.telemetry.stderrText ?? "").length <= 4000);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration fails when stdout line buffer exceeds the cap", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-long-stdout-line.sh", `#!/bin/bash
+read line
+head -c 1100000 /dev/zero | tr '\\000' x
+sleep 5
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, false);
+    assert.match(result.error ?? "", /RPC stdout line exceeded/);
+    assert.ok((result.telemetry.stdoutBufferBytes ?? 0) > 1_000_000);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -184,6 +237,104 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRpcIteration default handshake timeout tolerates slow extension startup", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-slow-handshake.sh", `#!/bin/bash
+set -euo pipefail
+read -r model_line
+read -r thinking_line
+sleep 5.5
+echo '{"type":"response","command":"set_model","success":true}'
+echo '{"type":"response","command":"set_thinking_level","success":true}'
+read -r prompt_line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 10_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-20250514",
+      thinkingLevel: "high",
+    });
+
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.lastAssistantText, "done");
+    assert.ok(result.telemetry.promptSentAt);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration fails immediately when set_model is rejected", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-model-rejected.sh", `#!/bin/bash
+set -euo pipefail
+read -r model_line
+echo '{"type":"response","command":"set_model","success":false,"error":"Model not found: provider/model"}'
+cat >/dev/null
+`);
+
+    const startedAt = Date.now();
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 10_000,
+      handshakeTimeoutMs: 5_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      provider: "provider",
+      modelId: "model",
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /set_model failed: Model not found: provider\/model/);
+    assert.equal(result.telemetry.promptSentAt, undefined);
+    assert.ok(Date.now() - startedAt < 2_000);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration fails immediately when set_thinking_level is rejected", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-thinking-rejected.sh", `#!/bin/bash
+set -euo pipefail
+read -r thinking_line
+echo '{"type":"response","command":"set_thinking_level","success":false,"error":"Unsupported thinking level"}'
+cat >/dev/null
+`);
+
+    const startedAt = Date.now();
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 10_000,
+      handshakeTimeoutMs: 5_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      thinkingLevel: "high",
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /set_thinking_level failed: Unsupported thinking level/);
+    assert.equal(result.telemetry.promptSentAt, undefined);
+    assert.ok(Date.now() - startedAt < 2_000);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration fails when handshake acknowledgements do not arrive before the timeout", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {
@@ -208,7 +359,7 @@ fi
       prompt: "test prompt",
       cwd,
       timeoutMs: 10_000,
-      handshakeTimeoutMs: 100,
+      handshakeTimeoutMs: 500,
       spawnCommand: "bash",
       spawnArgs: [mockScript, logFile],
       provider: "anthropic",
@@ -341,6 +492,36 @@ sleep 30
     assert.equal(result.telemetry.lastEventType, "response");
     assert.ok(result.telemetry.timedOutAt);
     assert.equal(result.telemetry.exitedAt, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration timeout kills the RPC subprocess tree", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("process-group termination is Unix-only");
+    return;
+  }
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const markerPath = join(cwd, "rpc-child-survived.txt");
+    const mockScript = await writeMockScript(cwd, "mock-pi-timeout-tree.sh", `#!/bin/bash
+node -e 'setTimeout(() => require("node:fs").writeFileSync(process.argv[1], "alive"), 900)' ${JSON.stringify(markerPath)} &
+sleep 30
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 200,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, true);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    assert.equal(existsSync(markerPath), false);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

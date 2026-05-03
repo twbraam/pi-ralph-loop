@@ -1143,6 +1143,398 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRalphLoop reruns acceptance commands before required completion can stop", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const commandCalls: CommandDef[][] = [];
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands) => {
+        commandCalls.push(commands);
+        return commands.map((command): CommandOutput => ({
+          name: command.name,
+          output: "tests passed",
+          status: "ok",
+          acceptance: command.acceptance,
+        }));
+      },
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.equal(commandCalls.length, 2);
+    assert.deepEqual(commandCalls.map((commands) => commands.map((command) => command.name)), [["tests"], ["tests"]]);
+    assert.deepEqual(result.iterations[0].completionGate, { ready: true, reasons: [] });
+    assert.deepEqual(result.iterations[0].completion?.acceptanceOutcomes, [
+      { name: "tests", status: "ok", acceptance: true, outputPreview: "tests passed" },
+    ]);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop blocks required completion when acceptance commands fail", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands) => commands.map((command): CommandOutput => ({
+        name: command.name,
+        output: "[timed out after 120s]",
+        status: "timeout",
+        acceptance: command.acceptance,
+      })),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "max-iterations");
+    assert.deepEqual(result.iterations[0].completionGate, {
+      ready: false,
+      reasons: ["Acceptance command failed: tests (timeout)"],
+    });
+    assert.deepEqual(result.iterations[0].completion?.blockingReasons, ["Acceptance command failed: tests (timeout)"]);
+    assert.deepEqual(result.iterations[0].completion?.acceptanceOutcomes, [
+      { name: "tests", status: "timeout", acceptance: true, outputPreview: "[timed out after 120s]" },
+    ]);
+
+    const acceptanceEvent = readRunnerEvents(taskDir).find(isRunnerEventType("completion.acceptance.checked"));
+    assert.ok(acceptanceEvent);
+    assert.equal(acceptanceEvent.ready, false);
+    assert.deepEqual(acceptanceEvent.reasons, ["Acceptance command failed: tests (timeout)"]);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop blocks required completion when acceptance command exits non-zero", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "node -e \"process.stderr.write('tests failed'); process.exit(1)\"", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands, guardrails, pi, cwd, loopTaskDir) => runCommands(commands, guardrails, pi as any, {}, cwd, loopTaskDir),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "max-iterations");
+    assert.deepEqual(result.iterations[0].completionGate, {
+      ready: false,
+      reasons: ["Acceptance command failed: tests (error)"],
+    });
+    assert.deepEqual(result.iterations[0].completion?.acceptanceOutcomes, [
+      { name: "tests", status: "error", acceptance: true, outputPreview: "[exit 1]\ntests failed" },
+    ]);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop blocks required completion when acceptance command is signal-terminated", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "kill -TERM $$", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands, guardrails, pi, cwd, loopTaskDir) => runCommands(commands, guardrails, pi as any, {}, cwd, loopTaskDir),
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "max-iterations");
+    assert.deepEqual(result.iterations[0].completionGate, {
+      ready: false,
+      reasons: ["Acceptance command failed: tests (error)"],
+    });
+    assert.deepEqual(result.iterations[0].completion?.acceptanceOutcomes, [
+      { name: "tests", status: "error", acceptance: true, outputPreview: "[signal SIGTERM]" },
+    ]);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop blocks required completion when acceptance executor is unavailable", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+    });
+
+    assert.equal(result.status, "max-iterations");
+    assert.deepEqual(result.iterations[0].completionGate, {
+      ready: false,
+      reasons: ["Acceptance commands could not be run: executor unavailable"],
+    });
+    assert.deepEqual(result.iterations[0].completion?.blockingReasons, ["Acceptance commands could not be run: executor unavailable"]);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop includes acceptance rerun time in completed iteration duration", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return commands.map((command): CommandOutput => ({ name: command.name, output: "tests passed", status: "ok", acceptance: command.acceptance }));
+      },
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.ok((result.iterations[0].durationMs ?? 0) >= 40);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop does not let acceptance commands block optional completion gates", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        completion_gate: "optional",
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const commandCalls: CommandDef[][] = [];
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (commands) => {
+        commandCalls.push(commands);
+        return commands.map((command): CommandOutput => ({
+          name: command.name,
+          output: "[timed out after 120s]",
+          status: "timeout",
+          acceptance: command.acceptance,
+        }));
+      },
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "complete");
+    assert.equal(commandCalls.length, 1);
+    assert.equal(result.iterations[0].completion?.acceptanceOutcomes, undefined);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop records completion observability events when the completion gate is blocked", async () => {
   const taskDir = createTempDir();
   try {
