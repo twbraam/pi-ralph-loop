@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, join, parse as parsePath, resolve } from "node:path";
 
 export type StaticRunnerReportResult = {
   reportPath: string;
@@ -16,8 +16,40 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function isAllowedDarwinSystemRootAlias(path: string): boolean {
+  return process.platform === "darwin" && (path === "/var" || path === "/tmp" || path === "/etc");
+}
+
+function assertNoSymlinkedExistingPathSegments(targetPath: string, label: string): void {
+  const resolvedTarget = resolve(targetPath);
+  const parsed = parsePath(resolvedTarget);
+  let current = parsed.root;
+  const segments = resolvedTarget.slice(parsed.root.length).split(/[\\/]+/).filter(Boolean);
+
+  for (const segment of segments) {
+    current = join(current, segment);
+    if (!existsSync(current)) continue;
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch {
+      throw new Error(`Unsafe ${label}: ${current}`);
+    }
+    if (stat.isSymbolicLink() && !isAllowedDarwinSystemRootAlias(current)) {
+      throw new Error(`Unsafe ${label}: ${current}`);
+    }
+  }
+}
+
 function readArtifact(path: string): string {
-  return existsSync(path) ? readFileSync(path, "utf8") : "";
+  if (!existsSync(path)) return "";
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) return "";
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
 }
 
 function nonEmptyLines(value: string): string[] {
@@ -46,6 +78,15 @@ function renderJsonLineList(lines: string[]): string {
 }
 
 export function generateStaticRunnerReport(artifactsDir: string, reportName = "report.html"): StaticRunnerReportResult {
+  if (!reportName || reportName === "." || reportName === ".." || reportName !== basename(reportName)) {
+    throw new Error("reportName must be a basename-only file name");
+  }
+  assertNoSymlinkedExistingPathSegments(artifactsDir, "artifactsDir path segment");
+  const artifactsStat = lstatSync(artifactsDir);
+  if (artifactsStat.isSymbolicLink() || !artifactsStat.isDirectory()) {
+    throw new Error(`artifactsDir must be a regular directory: ${artifactsDir}`);
+  }
+
   const status = readArtifact(join(artifactsDir, "status.json"));
   const iterationsJsonl = readArtifact(join(artifactsDir, "iterations.jsonl"));
   const eventsJsonl = readArtifact(join(artifactsDir, "events.jsonl"));
@@ -85,6 +126,6 @@ export function generateStaticRunnerReport(artifactsDir: string, reportName = "r
 </html>
 `;
 
-  writeFileSync(reportPath, html, "utf8");
+  writeFileSync(reportPath, html, { encoding: "utf8", flag: "wx" });
   return { reportPath, iterations: iterationLines.length, events: eventLines.length };
 }
