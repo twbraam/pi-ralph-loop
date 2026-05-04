@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -252,6 +252,34 @@ test("writeStatusFile preserves completionPromise and guardrails", () => {
   }
 });
 
+test("readStatusFile rejects symlinked status.json", () => {
+  const taskDir = createTempDir();
+  const outside = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const outsideStatus = join(outside, "status.json");
+    writeFileSync(outsideStatus, JSON.stringify(makeStatusFile({ taskDir, status: "complete" })), "utf8");
+    symlinkSync(outsideStatus, join(taskDir, ".ralph-runner", "status.json"));
+
+    assert.equal(readStatusFile(taskDir), undefined);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("readStatusFile rejects oversized status.json", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ ...makeStatusFile({ taskDir }), padding: "x".repeat(70 * 1024) }), "utf8");
+
+    assert.equal(readStatusFile(taskDir), undefined);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 // --- appendIterationRecord / readIterationRecords ---
 
 test("appendIterationRecord and readIterationRecords round-trip", () => {
@@ -308,6 +336,49 @@ test("readIterationRecords skips corrupted JSONL lines without discarding valid 
   }
 });
 
+test("readIterationRecords rejects symlinked iterations.jsonl", () => {
+  const taskDir = createTempDir();
+  const outside = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const outsideIterations = join(outside, "iterations.jsonl");
+    writeFileSync(outsideIterations, `${JSON.stringify(makeIterationRecord({ iteration: 99, changedFiles: ["secret.md"] }))}\n`, "utf8");
+    symlinkSync(outsideIterations, join(taskDir, ".ralph-runner", "iterations.jsonl"));
+
+    assert.deepEqual(readIterationRecords(taskDir), []);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("readIterationRecords caps parsed records", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const lines = Array.from({ length: 1100 }, (_, index) => JSON.stringify(makeIterationRecord({ iteration: index + 1 })));
+    writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+    const records = readIterationRecords(taskDir);
+    assert.equal(records.length, 1000);
+    assert.equal(records[999].iteration, 1000);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("readIterationRecords rejects oversized iterations.jsonl", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), `${JSON.stringify(makeIterationRecord({ iteration: 1 }))}\n${"x".repeat(1024 * 1024)}\n`, "utf8");
+
+    assert.deepEqual(readIterationRecords(taskDir), []);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("appendIterationRecord creates iterations.jsonl if missing", () => {
   const taskDir = createTempDir();
   try {
@@ -340,6 +411,58 @@ test("appendRunnerEvent and readRunnerEvents round-trip", () => {
     assert.equal(events.length, 1);
     assert.deepEqual(events[0], event);
     assert.ok(existsSync(join(taskDir, ".ralph-runner", "events.jsonl")));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("readRunnerEvents rejects symlinked events.jsonl", () => {
+  const taskDir = createTempDir();
+  const outside = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const event = { type: "runner.finished", timestamp: new Date().toISOString(), loopToken: "secret", status: "complete", iterations: 1, totalDurationMs: 1 } satisfies Extract<RunnerEvent, { type: "runner.finished" }>;
+    const outsideEvents = join(outside, "events.jsonl");
+    writeFileSync(outsideEvents, `${JSON.stringify(event)}\n`, "utf8");
+    symlinkSync(outsideEvents, join(taskDir, ".ralph-runner", "events.jsonl"));
+
+    assert.deepEqual(readRunnerEvents(taskDir), []);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("readRunnerEvents caps parsed events", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const lines = Array.from({ length: 1100 }, (_, index) => JSON.stringify({
+      type: "runner.finished",
+      timestamp: new Date().toISOString(),
+      loopToken: `loop-${index + 1}`,
+      status: "complete",
+      iterations: index + 1,
+      totalDurationMs: 1,
+    } satisfies Extract<RunnerEvent, { type: "runner.finished" }>));
+    writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+    const events = readRunnerEvents(taskDir);
+    assert.equal(events.length, 1000);
+    assert.equal(events[999].loopToken, "loop-1000");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("readRunnerEvents rejects oversized events.jsonl", () => {
+  const taskDir = createTempDir();
+  try {
+    ensureRunnerDir(taskDir);
+    const event = { type: "runner.finished", timestamp: new Date().toISOString(), loopToken: "loop-1", status: "complete", iterations: 1, totalDurationMs: 1 } satisfies Extract<RunnerEvent, { type: "runner.finished" }>;
+    writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), `${JSON.stringify(event)}\n${"x".repeat(1024 * 1024)}\n`, "utf8");
+
+    assert.deepEqual(readRunnerEvents(taskDir), []);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
@@ -600,6 +723,65 @@ test("active loop registry prunes stale entries and preserves fresh ones", () =>
   }
 });
 
+test("active loop registry ignores symlinked per-loop registry files", () => {
+  const cwd = createTempDir();
+  const outside = createTempDir();
+  try {
+    const taskDir = join(cwd, "symlink-registry-task");
+    mkdirSync(taskDir, { recursive: true });
+    writeActiveLoopRegistryEntry(cwd, {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd,
+      loopToken: "symlink-loop-token",
+      status: "running",
+      currentIteration: 1,
+      maxIterations: 2,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const registryDir = join(cwd, ".ralph-runner", "active-loops");
+    const [entryFile] = readdirSync(registryDir).filter((name) => name.endsWith(".json"));
+    rmSync(join(registryDir, entryFile), { force: true });
+    const outsideFile = join(outside, "outside.json");
+    writeFileSync(outsideFile, JSON.stringify({ taskDir, ralphPath: join(taskDir, "RALPH.md"), cwd, loopToken: "outside", status: "running", currentIteration: 1, maxIterations: 2, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }), "utf8");
+    symlinkSync(outsideFile, join(registryDir, entryFile));
+
+    assert.deepEqual(readActiveLoopRegistry(cwd), []);
+    assert.equal(readFileSync(outsideFile, "utf8").includes("outside"), true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("active loop registry ignores oversized per-loop registry files", () => {
+  const cwd = createTempDir();
+  try {
+    const taskDir = join(cwd, "oversized-registry-task");
+    mkdirSync(taskDir, { recursive: true });
+    writeActiveLoopRegistryEntry(cwd, {
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      cwd,
+      loopToken: "oversized-loop-token",
+      status: "running",
+      currentIteration: 1,
+      maxIterations: 2,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const registryDir = join(cwd, ".ralph-runner", "active-loops");
+    const [entryFile] = readdirSync(registryDir).filter((name) => name.endsWith(".json"));
+    writeFileSync(join(registryDir, entryFile), `${"x".repeat(70 * 1024)}`, "utf8");
+
+    assert.deepEqual(readActiveLoopRegistry(cwd), []);
+    assert.deepEqual(listActiveLoopRegistryEntries(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("active loop registry reads legacy active-loops.json files", () => {
   const cwd = createTempDir();
   try {
@@ -623,6 +805,36 @@ test("active loop registry reads legacy active-loops.json files", () => {
 
     assert.deepEqual(readActiveLoopRegistry(cwd), [entry]);
     assert.deepEqual(listActiveLoopRegistryEntries(cwd), [entry]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("active loop registry ignores symlinked legacy active-loops.json files", () => {
+  const cwd = createTempDir();
+  const outside = createTempDir();
+  try {
+    ensureRunnerDir(cwd);
+    const outsideFile = join(outside, "active-loops.json");
+    writeFileSync(outsideFile, JSON.stringify([{ taskDir: join(cwd, "task"), ralphPath: join(cwd, "task", "RALPH.md"), cwd, loopToken: "outside", status: "running", currentIteration: 1, maxIterations: 2, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }]), "utf8");
+    symlinkSync(outsideFile, join(cwd, ".ralph-runner", "active-loops.json"));
+
+    assert.deepEqual(readActiveLoopRegistry(cwd), []);
+    assert.equal(readFileSync(outsideFile, "utf8").includes("outside"), true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("active loop registry ignores oversized legacy active-loops.json files", () => {
+  const cwd = createTempDir();
+  try {
+    ensureRunnerDir(cwd);
+    writeFileSync(join(cwd, ".ralph-runner", "active-loops.json"), `${"x".repeat(70 * 1024)}`, "utf8");
+
+    assert.deepEqual(readActiveLoopRegistry(cwd), []);
+    assert.deepEqual(listActiveLoopRegistryEntries(cwd), []);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

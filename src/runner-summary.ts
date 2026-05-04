@@ -1,4 +1,4 @@
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -8,6 +8,21 @@ const SUMMARY_ARTIFACT_MAX_BYTES = 256 * 1024;
 const TRANSCRIPT_REFERENCE_MAX = 20;
 const RALPH_PROGRESS_FILE = "RALPH_PROGRESS.md";
 const FINAL_SUMMARY_FILE = "final-summary.md";
+
+function runnerDir(taskDir: string): string {
+  return join(taskDir, ".ralph-runner");
+}
+
+function isSafeExistingRunnerDir(taskDir: string): boolean {
+  const dir = runnerDir(taskDir);
+  if (!existsSync(dir)) return false;
+  try {
+    const stat = lstatSync(dir);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 
 type SummaryStatus = {
   loopToken?: string;
@@ -28,45 +43,61 @@ type SummaryIterationRecord = {
   changedFiles: string[];
   noProgressStreak: number;
   completionGate?: { ready: boolean; reasons: string[] };
-  commandOutcomes?: StructuredCommandOutcome[];
   loopToken?: string;
 };
 
-type StructuredCommandOutcome = {
-  name: string;
-  status: string;
-  acceptance?: boolean;
-  blockedPattern?: string;
-  durationMs?: number;
-};
+type EventCountResult =
+  | { kind: "count"; count: number }
+  | { kind: "unavailable"; message: string };
 
 export type RalphRunSummaryOptions = {
   recentIterations?: number;
   transcriptTailChars?: number;
 };
 
-function readRegularFileBounded(filePath: string, label: string, maxBytes = SUMMARY_ARTIFACT_MAX_BYTES, mode: "head" | "tail" = "head"): string {
-  if (!existsSync(filePath)) return `${label} not found.`;
+function openRegularFileNoFollow(filePath: string, maxBytes?: number): { fd: number; size: number } | undefined {
+  if (!existsSync(filePath)) return undefined;
   let fd: number | undefined;
   try {
     const stat = lstatSync(filePath);
-    if (!stat.isFile() || stat.isSymbolicLink()) return `${label} is not a regular file.`;
-    const bytesToRead = Math.min(stat.size, Math.max(0, maxBytes));
-    const offset = mode === "tail" ? Math.max(0, stat.size - bytesToRead) : 0;
+    if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+    if (maxBytes !== undefined && stat.size > maxBytes) return undefined;
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    fd = openSync(filePath, fsConstants.O_RDONLY | noFollow);
+    const openedStat = fstatSync(fd);
+    if (!openedStat.isFile()) return undefined;
+    if (maxBytes !== undefined && openedStat.size > maxBytes) return undefined;
+    const result = { fd, size: openedStat.size };
+    fd = undefined;
+    return result;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function readRegularFileBounded(filePath: string, label: string, maxBytes = SUMMARY_ARTIFACT_MAX_BYTES, mode: "head" | "tail" = "head"): string {
+  if (!existsSync(filePath)) return `${label} not found.`;
+  let opened: { fd: number; size: number } | undefined;
+  try {
+    opened = openRegularFileNoFollow(filePath);
+    if (!opened) return `${label} is not a regular file.`;
+    const bytesToRead = Math.min(opened.size, Math.max(0, maxBytes));
+    const offset = mode === "tail" ? Math.max(0, opened.size - bytesToRead) : 0;
     const buffer = Buffer.alloc(bytesToRead);
-    fd = openSync(filePath, "r");
-    const bytesRead = bytesToRead > 0 ? readSync(fd, buffer, 0, bytesToRead, offset) : 0;
+    const bytesRead = bytesToRead > 0 ? readSync(opened.fd, buffer, 0, bytesToRead, offset) : 0;
     const text = buffer.toString("utf8", 0, bytesRead).trim();
     const fallback = text || `${label} is empty.`;
-    if (stat.size <= maxBytes) return fallback;
+    if (opened.size <= maxBytes) return fallback;
     return mode === "tail"
-      ? `[truncated to last ${maxBytes} bytes from ${stat.size} bytes]\n${fallback}`
-      : `${fallback}\n[truncated to first ${maxBytes} bytes from ${stat.size} bytes]`;
+      ? `[truncated to last ${maxBytes} bytes from ${opened.size} bytes]\n${fallback}`
+      : `${fallback}\n[truncated to first ${maxBytes} bytes from ${opened.size} bytes]`;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return `${label} unreadable: ${message}`;
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    if (opened !== undefined) closeSync(opened.fd);
   }
 }
 
@@ -107,24 +138,9 @@ function coerceCompletionGate(value: unknown): { ready: boolean; reasons: string
   return { ready: record.ready, reasons: stringArray(record.reasons) };
 }
 
-function coerceCommandOutcomes(value: unknown): StructuredCommandOutcome[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const outcomes = value.flatMap((entry): StructuredCommandOutcome[] => {
-    const outcome = asRecord(entry);
-    if (!outcome || typeof outcome.name !== "string" || typeof outcome.status !== "string") return [];
-    return [{
-      name: outcome.name,
-      status: outcome.status,
-      ...(outcome.acceptance === true ? { acceptance: true } : {}),
-      ...(typeof outcome.blockedPattern === "string" ? { blockedPattern: outcome.blockedPattern } : {}),
-      ...(typeof outcome.durationMs === "number" ? { durationMs: outcome.durationMs } : {}),
-    }];
-  });
-  return outcomes.length > 0 ? outcomes : undefined;
-}
-
 function readSummaryStatus(taskDir: string): SummaryStatus | undefined {
-  const raw = readRegularFileBounded(join(taskDir, ".ralph-runner", "status.json"), "status.json");
+  if (!isSafeExistingRunnerDir(taskDir)) return undefined;
+  const raw = readRegularFileBounded(join(runnerDir(taskDir), "status.json"), "status.json");
   let parsed: Record<string, unknown> | undefined;
   try {
     parsed = asRecord(JSON.parse(raw));
@@ -143,7 +159,8 @@ function readSummaryStatus(taskDir: string): SummaryStatus | undefined {
 }
 
 function readSummaryIterations(taskDir: string): SummaryIterationRecord[] {
-  const raw = readRegularFileBounded(join(taskDir, ".ralph-runner", "iterations.jsonl"), "iterations.jsonl", SUMMARY_ARTIFACT_MAX_BYTES, "tail");
+  if (!isSafeExistingRunnerDir(taskDir)) return [];
+  const raw = readRegularFileBounded(join(runnerDir(taskDir), "iterations.jsonl"), "iterations.jsonl", SUMMARY_ARTIFACT_MAX_BYTES, "tail");
   return parseJsonLines(raw).flatMap((value, index): SummaryIterationRecord[] => {
     const record = asRecord(value);
     if (!record) return [];
@@ -159,24 +176,50 @@ function readSummaryIterations(taskDir: string): SummaryIterationRecord[] {
       changedFiles: stringArray(record.changedFiles),
       noProgressStreak: typeof record.noProgressStreak === "number" ? record.noProgressStreak : 0,
       ...(coerceCompletionGate(record.completionGate) ? { completionGate: coerceCompletionGate(record.completionGate) } : {}),
-      ...(coerceCommandOutcomes(record.commandOutcomes) ? { commandOutcomes: coerceCommandOutcomes(record.commandOutcomes) } : {}),
       ...(typeof record.loopToken === "string" ? { loopToken: record.loopToken } : {}),
     }];
   });
 }
 
-function countNonEmptyLines(filePath: string): number {
-  if (!existsSync(filePath)) return 0;
+function openEventsForCounting(filePath: string): { fd: number; size: number } | EventCountResult {
+  if (!existsSync(filePath)) return { kind: "count", count: 0 };
   let fd: number | undefined;
   try {
     const stat = lstatSync(filePath);
-    if (!stat.isFile() || stat.isSymbolicLink()) return 0;
-    fd = openSync(filePath, "r");
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return { kind: "unavailable", message: "events.jsonl is not a regular file; exact event count unavailable." };
+    }
+    if (stat.size > SUMMARY_ARTIFACT_MAX_BYTES) {
+      return { kind: "unavailable", message: `events.jsonl exceeds ${SUMMARY_ARTIFACT_MAX_BYTES} bytes; exact event count unavailable.` };
+    }
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    fd = openSync(filePath, fsConstants.O_RDONLY | noFollow);
+    const openedStat = fstatSync(fd);
+    if (!openedStat.isFile()) {
+      return { kind: "unavailable", message: "events.jsonl is not a regular file; exact event count unavailable." };
+    }
+    if (openedStat.size > SUMMARY_ARTIFACT_MAX_BYTES) {
+      return { kind: "unavailable", message: `events.jsonl exceeds ${SUMMARY_ARTIFACT_MAX_BYTES} bytes; exact event count unavailable.` };
+    }
+    const result = { fd, size: openedStat.size };
+    fd = undefined;
+    return result;
+  } catch {
+    return { kind: "unavailable", message: "events.jsonl unreadable; exact event count unavailable." };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function countNonEmptyLines(filePath: string): EventCountResult {
+  const opened = openEventsForCounting(filePath);
+  if ("kind" in opened) return opened;
+  try {
     const buffer = Buffer.alloc(64 * 1024);
     let count = 0;
     let currentLineHasContent = false;
     while (true) {
-      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      const bytesRead = readSync(opened.fd, buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
       const chunk = buffer.toString("utf8", 0, bytesRead);
       for (const char of chunk) {
@@ -189,23 +232,21 @@ function countNonEmptyLines(filePath: string): number {
       }
     }
     if (currentLineHasContent) count += 1;
-    return count;
+    return { kind: "count", count };
   } catch {
-    return 0;
+    return { kind: "unavailable", message: "events.jsonl unreadable; exact event count unavailable." };
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    closeSync(opened.fd);
   }
 }
 
-function countEventsForLoopToken(taskDir: string, loopToken: string | undefined): number {
-  const filePath = join(taskDir, ".ralph-runner", "events.jsonl");
+function countEventsForLoopToken(taskDir: string, loopToken: string | undefined): EventCountResult {
+  if (!isSafeExistingRunnerDir(taskDir)) return { kind: "unavailable", message: "events.jsonl not found or unavailable." };
+  const filePath = join(runnerDir(taskDir), "events.jsonl");
   if (!loopToken) return countNonEmptyLines(filePath);
-  if (!existsSync(filePath)) return 0;
-  let fd: number | undefined;
+  const opened = openEventsForCounting(filePath);
+  if ("kind" in opened) return opened;
   try {
-    const stat = lstatSync(filePath);
-    if (!stat.isFile() || stat.isSymbolicLink()) return 0;
-    fd = openSync(filePath, "r");
     const buffer = Buffer.alloc(64 * 1024);
     let currentLine = "";
     let currentLineTooLarge = false;
@@ -222,7 +263,7 @@ function countEventsForLoopToken(taskDir: string, loopToken: string | undefined)
       currentLineTooLarge = false;
     };
     while (true) {
-      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      const bytesRead = readSync(opened.fd, buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
       const chunk = buffer.toString("utf8", 0, bytesRead);
       for (const char of chunk) {
@@ -238,12 +279,17 @@ function countEventsForLoopToken(taskDir: string, loopToken: string | undefined)
       }
     }
     consumeLine();
-    return count;
+    return { kind: "count", count };
   } catch {
-    return 0;
+    return { kind: "unavailable", message: "events.jsonl unreadable; exact event count unavailable." };
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    closeSync(opened.fd);
   }
+}
+
+function formatEventCount(result: EventCountResult): string {
+  if (result.kind === "unavailable") return result.message;
+  return `${result.count} non-empty event lines counted from events.jsonl.`;
 }
 
 function formatDuration(ms: number | undefined): string {
@@ -256,19 +302,6 @@ function formatCompletionGate(record: SummaryIterationRecord | undefined): strin
   if (!record?.completionGate) return "Not checked in latest iteration.";
   if (record.completionGate.ready) return "Ready.";
   return `Blocked: ${record.completionGate.reasons.length > 0 ? record.completionGate.reasons.join("; ") : "unknown reason"}.`;
-}
-
-function formatCommandOutcomes(record: SummaryIterationRecord | undefined): string[] {
-  const outcomes = record?.commandOutcomes ?? [];
-  if (outcomes.length === 0) return ["No structured command outcomes recorded."];
-  return outcomes.map((outcome) => {
-    const details = [
-      outcome.acceptance ? "acceptance" : "evidence",
-      outcome.blockedPattern ? `blocked by ${outcome.blockedPattern}` : "",
-      typeof outcome.durationMs === "number" ? formatDuration(outcome.durationMs) : "",
-    ].filter(Boolean);
-    return `- ${outcome.name}: ${outcome.status}${details.length > 0 ? ` (${details.join(", ")})` : ""}`;
-  });
 }
 
 function formatRecentIterations(records: SummaryIterationRecord[], count: number): string[] {
@@ -287,7 +320,8 @@ function formatChangedFiles(records: SummaryIterationRecord[]): string[] {
 }
 
 function transcriptPaths(taskDir: string): string[] {
-  const dir = join(taskDir, ".ralph-runner", "transcripts");
+  if (!isSafeExistingRunnerDir(taskDir)) return [];
+  const dir = join(runnerDir(taskDir), "transcripts");
   if (!existsSync(dir)) return [];
   try {
     const stat = lstatSync(dir);
@@ -399,10 +433,6 @@ export function buildRalphRunSummary(taskDir: string, options: RalphRunSummaryOp
     "",
     formatCompletionGate(latest),
     "",
-    "## Latest Command Outcomes",
-    "",
-    ...formatCommandOutcomes(latest),
-    "",
     "## Recent Iterations",
     "",
     ...formatRecentIterations(records, recentIterations),
@@ -423,7 +453,7 @@ export function buildRalphRunSummary(taskDir: string, options: RalphRunSummaryOp
     "",
     "## Event Count",
     "",
-    `${eventCount} non-empty event lines counted from events.jsonl.`,
+    formatEventCount(eventCount),
     "",
     "## Next Action",
     "",
@@ -432,17 +462,17 @@ export function buildRalphRunSummary(taskDir: string, options: RalphRunSummaryOp
 }
 
 export function writeRalphFinalSummary(taskDir: string): string {
-  const runnerDir = join(taskDir, ".ralph-runner");
-  if (existsSync(runnerDir)) {
-    const stat = lstatSync(runnerDir);
+  const dir = runnerDir(taskDir);
+  if (existsSync(dir)) {
+    const stat = lstatSync(dir);
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
-      throw new Error(`Unsafe .ralph-runner directory: ${runnerDir}`);
+      throw new Error(`Unsafe .ralph-runner directory: ${dir}`);
     }
   } else {
-    mkdirSync(runnerDir, { recursive: true });
+    mkdirSync(dir, { recursive: true });
   }
 
-  const summaryPath = join(runnerDir, FINAL_SUMMARY_FILE);
+  const summaryPath = join(dir, FINAL_SUMMARY_FILE);
   if (existsSync(summaryPath)) {
     const stat = lstatSync(summaryPath);
     if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -450,7 +480,7 @@ export function writeRalphFinalSummary(taskDir: string): string {
     }
   }
 
-  const tmpPath = join(runnerDir, `.${FINAL_SUMMARY_FILE}.${process.pid}.${randomUUID()}.tmp`);
+  const tmpPath = join(dir, `.${FINAL_SUMMARY_FILE}.${process.pid}.${randomUUID()}.tmp`);
   try {
     writeFileSync(tmpPath, buildRalphRunSummary(taskDir), { encoding: "utf8", flag: "wx" });
     renameSync(tmpPath, summaryPath);

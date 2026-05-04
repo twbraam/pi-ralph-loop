@@ -237,6 +237,43 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRpcIteration explicit provider overrides modelPattern provider", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const logFile = join(cwd, "provider-override.log");
+    const mockScript = await writeMockScript(cwd, "mock-pi-provider-override.sh", `#!/bin/bash
+set -euo pipefail
+log_file="$1"
+read -r model_line
+printf 'model_line=%s\n' "$model_line" >> "$log_file"
+read -r thinking_line
+printf 'thinking_line=%s\n' "$thinking_line" >> "$log_file"
+echo '{"type":"response","command":"set_model","success":true}'
+echo '{"type":"response","command":"set_thinking_level","success":true}'
+read -r prompt_line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript, logFile],
+      provider: "override-provider",
+      modelPattern: "pattern-provider/pattern-model:high",
+    });
+
+    assert.equal(result.success, true);
+    const logLines = readFileSync(logFile, "utf8").trim().split("\n");
+    assert.equal(logLines[0], `model_line=${JSON.stringify({ type: "set_model", provider: "override-provider", modelId: "pattern-model" })}`);
+    assert.equal(logLines[1], `thinking_line=${JSON.stringify({ type: "set_thinking_level", level: "high" })}`);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration default handshake timeout tolerates slow extension startup", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {

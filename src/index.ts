@@ -1507,18 +1507,7 @@ function exportRalphLogs(taskDir: string, destDir: string): { iterations: number
       });
     }
 
-    const summaryPath = join(runnerDir, "final-summary.md");
-    if (existsSync(summaryPath)) {
-      let stat;
-      try {
-        stat = lstatSync(summaryPath);
-      } catch {
-        stat = undefined;
-      }
-      if (stat?.isFile() && !stat.isSymbolicLink()) {
-        copyExportFileNoOverwrite(summaryPath, join(preparedDest.stagingDir, "final-summary.md"), runnerRootRealPath, stagingRootRealPath);
-      }
-    }
+    writeFileSync(join(preparedDest.stagingDir, "final-summary.md"), buildRalphRunSummary(taskDir), { encoding: "utf8", flag: "wx" });
 
     for (const file of ["iterations.jsonl", "events.jsonl"]) {
       const src = join(runnerDir, file);
@@ -1872,11 +1861,12 @@ Stop with <promise>DONE</promise> when finished.
 `;
 }
 
-function tokenizeScaffoldArgs(raw: string): { tokens: string[]; error?: string } {
-  const tokens: string[] = [];
+function tokenizeArgsWithQuoteInfo(raw: string, commandName: string): { tokens: Array<{ value: string; quoted: boolean }>; error?: string } {
+  const tokens: Array<{ value: string; quoted: boolean }> = [];
   let current = "";
   let quote: '"' | "'" | undefined;
   let inToken = false;
+  let quoted = false;
 
   for (const char of raw) {
     if (quote) {
@@ -1891,14 +1881,16 @@ function tokenizeScaffoldArgs(raw: string): { tokens: string[]; error?: string }
     if (char === '"' || char === "'") {
       quote = char;
       inToken = true;
+      quoted = true;
       continue;
     }
 
     if (/\s/.test(char)) {
       if (inToken) {
-        tokens.push(current);
+        tokens.push({ value: current, quoted });
         current = "";
         inToken = false;
+        quoted = false;
       }
       continue;
     }
@@ -1908,14 +1900,19 @@ function tokenizeScaffoldArgs(raw: string): { tokens: string[]; error?: string }
   }
 
   if (quote) {
-    return { tokens, error: "Unterminated quote in /ralph-scaffold arguments." };
+    return { tokens, error: `Unterminated quote in ${commandName} arguments.` };
   }
 
   if (inToken) {
-    tokens.push(current);
+    tokens.push({ value: current, quoted });
   }
 
   return { tokens };
+}
+
+function tokenizeScaffoldArgs(raw: string): { tokens: string[]; error?: string } {
+  const tokenized = tokenizeArgsWithQuoteInfo(raw, "/ralph-scaffold");
+  return { tokens: tokenized.tokens.map((token) => token.value), error: tokenized.error };
 }
 
 function parseScaffoldArgs(raw: string): ScaffoldArgs {
@@ -2468,14 +2465,14 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       const target = resolveLifecycleTarget(ctx, parsed.value?.trim() || ".", "/ralph-status");
       if (!target) return;
 
-      const statusFile = readStatusFile(target.taskDir);
-      if (!statusFile) {
-        ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, target.taskDir)}.`, "warning");
+      if (statusArgs.summary) {
+        ctx.ui.notify(buildRalphRunSummary(target.taskDir), "info");
         return;
       }
 
-      if (statusArgs.summary) {
-        ctx.ui.notify(buildRalphRunSummary(target.taskDir), "info");
+      const statusFile = readStatusFile(target.taskDir);
+      if (!statusFile) {
+        ctx.ui.notify(`No ralph run data found at ${displayPath(ctx.cwd, target.taskDir)}.`, "warning");
         return;
       }
 

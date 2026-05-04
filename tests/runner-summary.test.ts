@@ -74,7 +74,8 @@ test("buildRalphRunSummary summarizes durable Ralph artifacts deterministically"
     assert.doesNotMatch(summary, /RALPH\.md: ---/);
     assert.match(summary, /Status: complete/);
     assert.match(summary, /Blocked: OPEN_QUESTIONS\.md still has P0 items\./);
-    assert.match(summary, /No structured command outcomes recorded/);
+    assert.doesNotMatch(summary, /Latest Command Outcomes/);
+    assert.doesNotMatch(summary, /structured command outcomes/);
     assert.match(summary, /- #2 complete progress=true duration=60s changed=src\/parser\.ts noProgressStreak=0/);
     assert.match(summary, /- src\/parser\.ts/);
     assert.match(summary, /- fixed parser/);
@@ -284,6 +285,74 @@ test("buildRalphRunSummary ignores symlinked status and JSONL artifacts", () => 
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("buildRalphRunSummary ignores a symlinked .ralph-runner root", () => {
+  const root = createTempDir();
+  try {
+    const taskDir = join(root, "task");
+    const outside = join(root, "outside");
+    mkdirSync(taskDir, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(taskDir, "RALPH.md"), "# safe task\n", "utf8");
+    writeFileSync(join(outside, "status.json"), JSON.stringify({ status: "complete", currentIteration: 99, maxIterations: 99, startedAt: "leak" }), "utf8");
+    writeFileSync(join(outside, "iterations.jsonl"), "{\"iteration\":99,\"status\":\"complete\",\"changedFiles\":[\"secret\"]}\n", "utf8");
+    writeFileSync(join(outside, "events.jsonl"), "{\"loopToken\":\"leak\"}\n", "utf8");
+    symlinkSync(outside, join(taskDir, ".ralph-runner"), "dir");
+
+    const summary = buildRalphRunSummary(taskDir);
+
+    assert.match(summary, /status\.json not found or unreadable/);
+    assert.match(summary, /No iteration records found/);
+    assert.match(summary, /events\.jsonl not found or unavailable/);
+    assert.doesNotMatch(summary, /secret|leak|99\/99/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("buildRalphRunSummary ignores symlinked events artifacts", () => {
+  const taskDir = createTempDir();
+  const outside = createTempDir();
+  try {
+    mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+    writeFileSync(join(outside, "events.jsonl"), JSON.stringify({ type: "runner.finished", loopToken: "leak" }) + "\n", "utf8");
+    symlinkSync(join(outside, "events.jsonl"), join(taskDir, ".ralph-runner", "events.jsonl"));
+
+    const summary = buildRalphRunSummary(taskDir);
+
+    assert.match(summary, /events\.jsonl is not a regular file; exact event count unavailable\./);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("buildRalphRunSummary bounds event counting", () => {
+  const taskDir = createTempDir();
+  try {
+    mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+    writeStatusFile(taskDir, {
+      loopToken: "current-loop",
+      ralphPath: join(taskDir, "RALPH.md"),
+      taskDir,
+      cwd: taskDir,
+      status: "complete",
+      currentIteration: 1,
+      maxIterations: 1,
+      timeout: 120,
+      startedAt: "2026-05-03T10:00:00.000Z",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+    });
+    writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), `${JSON.stringify({ type: "runner.finished", loopToken: "current-loop" })}\n${"x".repeat(300 * 1024)}\n`, "utf8");
+
+    const summary = buildRalphRunSummary(taskDir);
+
+    assert.match(summary, /events\.jsonl exceeds 262144 bytes; exact event count unavailable\./);
+    assert.doesNotMatch(summary, /0 non-empty event lines counted/);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
   }
 });
 

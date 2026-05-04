@@ -1100,7 +1100,7 @@ test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) 
   writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), "{\"iteration\":1}\n{\"iteration\":2}\n", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), "{\"event\":1}\n", "utf8");
-  writeFileSync(join(taskDir, ".ralph-runner", "final-summary.md"), "# Final summary\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "final-summary.md"), "# Stale previous summary\nsecret stale data\n", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "one.txt"), "one", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "two.txt"), "two", "utf8");
 
@@ -1126,7 +1126,9 @@ test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) 
   assert.equal(existsSync(join(exportedDir, "status.json")), true);
   assert.equal(readFileSync(join(exportedDir, "iterations.jsonl"), "utf8"), "{\"iteration\":1}\n{\"iteration\":2}\n");
   assert.equal(readFileSync(join(exportedDir, "events.jsonl"), "utf8"), "{\"event\":1}\n");
-  assert.equal(readFileSync(join(exportedDir, "final-summary.md"), "utf8"), "# Final summary\n");
+  const exportedSummary = readFileSync(join(exportedDir, "final-summary.md"), "utf8");
+  assert.match(exportedSummary, /# Ralph Run Summary/);
+  assert.doesNotMatch(exportedSummary, /Stale previous summary|secret stale data/);
   assert.equal(readFileSync(join(exportedDir, "transcripts", "one.txt"), "utf8"), "one");
   assert.equal(readFileSync(join(exportedDir, "transcripts", "two.txt"), "utf8"), "two");
   assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts to ./exported")));
@@ -1174,7 +1176,7 @@ test("parseStatusCommandArgs treats --summary as an unquoted flag only", () => {
   assert.deepEqual(parseStatusCommandArgs('"unterminated'), { value: "", summary: false, error: "Unterminated quote in /ralph-status arguments." });
 });
 
-test("/ralph-logs skips symlinked final-summary artifacts", async (t) => {
+test("/ralph-logs generates final-summary instead of copying symlinked stale artifacts", async (t) => {
   const cwd = createTempDir();
   const outside = createTempDir();
   t.after(() => {
@@ -1208,7 +1210,9 @@ test("/ralph-logs skips symlinked final-summary artifacts", async (t) => {
 
   const exportedDir = join(cwd, "exported");
   assert.equal(existsSync(join(exportedDir, "status.json")), true);
-  assert.equal(existsSync(join(exportedDir, "final-summary.md")), false);
+  const exportedSummary = readFileSync(join(exportedDir, "final-summary.md"), "utf8");
+  assert.match(exportedSummary, /# Ralph Run Summary/);
+  assert.doesNotMatch(exportedSummary, /secret/);
 });
 
 test("/ralph-logs rejects symlinked destination parent path segments", async (t) => {

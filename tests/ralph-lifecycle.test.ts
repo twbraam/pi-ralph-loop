@@ -240,6 +240,34 @@ test("/ralph-status --summary renders deterministic run summary", async (t) => {
   assert.match(harness.notifications[0].message, /made progress/);
 });
 
+test("/ralph-status --summary renders missing status summary instead of preflight warning", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "summary-missing-status-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), createValidRalphMarkdown(), "utf8");
+  appendIterationRecord(taskDir, {
+    iteration: 1,
+    status: "complete",
+    startedAt: "2026-05-03T12:00:00.000Z",
+    completedAt: "2026-05-03T12:01:00.000Z",
+    durationMs: 60000,
+    progress: true,
+    changedFiles: ["SUMMARY.md"],
+    noProgressStreak: 0,
+  });
+
+  const harness = createHarness();
+  await invoke(harness, "ralph-status", `--summary ${taskDir}`, cwd);
+
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].level, "info");
+  assert.match(harness.notifications[0].message, /^# Ralph Run Summary/);
+  assert.match(harness.notifications[0].message, /status\.json not found or unreadable/);
+  assert.match(harness.notifications[0].message, /SUMMARY\.md/);
+});
+
 test("/ralph-resume refuses when active and starts when inactive", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
