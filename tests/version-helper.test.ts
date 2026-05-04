@@ -103,6 +103,11 @@ test("main ignores a stale, fully released, or prerelease package version", () =
   );
 });
 
+test("main ignores historical incomplete releases below the highest complete release", () => {
+  assert.equal(runVersionHelper("main", "none", ["0.0.1", "1.5.2"], ["v1.5.2"]), "");
+  assert.equal(runVersionHelper("main", "minor", ["0.0.1", "1.5.2"], ["v1.5.2"], "1.6.0"), "1.6.0");
+});
+
 test("main reuses the highest incomplete stable release before fresh version calculation", () => {
   assert.equal(
     runVersionHelper("main", "minor", ["1.5.2", "1.6.0"], ["v1.5.2"]),

@@ -265,8 +265,24 @@ function incompleteReleaseCandidates(branch: ReleaseBranch, npmVersions: readonl
   });
 }
 
+function completeReleaseVersions(branch: ReleaseBranch, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): string[] {
+  const npmSet = new Set(normalizedNpmVersions(npmVersions));
+  const gitSet = new Set(normalizedGitTags(gitTags));
+  return [...npmSet].filter((version) => {
+    if (!gitSet.has(version)) return false;
+    const parsed = parseVersion(version);
+    if (!parsed) return false;
+    if (branch === "main") return parsed.prerelease === undefined;
+    return parsed.prerelease !== undefined && DEV_PRERELEASE.test(parsed.prerelease);
+  });
+}
+
 function highestIncompleteReleaseVersion(branch: ReleaseBranch, npmVersions: readonly string[] | string, gitTags: readonly string[] | string): string | null {
-  return maxVersion(incompleteReleaseCandidates(branch, npmVersions, gitTags));
+  const highestComplete = maxVersion(completeReleaseVersions(branch, npmVersions, gitTags));
+  const candidates = incompleteReleaseCandidates(branch, npmVersions, gitTags).filter(
+    (version) => !highestComplete || compareVersions(version, highestComplete) > 0,
+  );
+  return maxVersion(candidates);
 }
 
 export function computeReleaseVersion({ branch, bump, npmVersions, gitTags, currentVersion }: ReleaseVersionRequest): string {
