@@ -20,10 +20,60 @@ test("generateStaticRunnerReport writes escaped static HTML from copied artifact
   assert.equal(result.reportPath, join(dir, "report.html"));
   assert.equal(existsSync(result.reportPath), true);
   const html = readFileSync(result.reportPath, "utf8");
-  assert.match(html, /Ralph Run Report/);
+  assert.match(html, /Ralph Loop Dossier/);
   assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
   assert.match(html, /use &lt;b&gt;bold&lt;\/b&gt;/);
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
+});
+
+test("generateStaticRunnerReport renders an operator dossier instead of a generic dashboard", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ralph-report-dossier-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  writeFileSync(join(dir, "status.json"), JSON.stringify({
+    status: "complete",
+    currentIteration: 2,
+    maxIterations: 3,
+    taskDir: "/repo/task-<x>",
+    startedAt: "2026-05-04T00:00:00.000Z",
+    completedAt: "2026-05-04T00:00:05.000Z",
+  }), "utf8");
+  writeFileSync(join(dir, "iterations.jsonl"), [
+    JSON.stringify({ iteration: 1, status: "complete", progress: true, changedFiles: ["src/a.ts"], durationMs: 1200, completionGate: { ready: false, reasons: ["not yet"] } }),
+    JSON.stringify({ iteration: 2, status: "complete", progress: false, changedFiles: [], durationMs: 3400, completionGate: { ready: true, reasons: [] }, completion: { promiseSeen: true } }),
+  ].join("\n") + "\n", "utf8");
+  writeFileSync(join(dir, "events.jsonl"), [
+    JSON.stringify({ type: "runner.started", timestamp: "2026-05-04T00:00:00.000Z" }),
+    JSON.stringify({ type: "completion_gate_passed", timestamp: "2026-05-04T00:00:05.000Z", ready: true }),
+  ].join("\n") + "\n", "utf8");
+  mkdirSync(join(dir, "transcripts"));
+  writeFileSync(join(dir, "transcripts", "iteration-001-safe.md"), "transcript", "utf8");
+
+  const result = generateStaticRunnerReport(dir);
+  const html = readFileSync(result.reportPath, "utf8");
+
+  assert.match(html, /<title>Ralph Loop Dossier<\/title>/);
+  assert.match(html, /class="page dossier-page"/);
+  assert.match(html, /class="toc"/);
+  assert.match(html, /class="cover"/);
+  assert.match(html, /Static audit packet/);
+  assert.match(html, /class="stamp stamp-good">COMPLETE<\/strong>/);
+  assert.match(html, /class="fact-grid"/);
+  assert.match(html, /<dt>Case ID<\/dt>/);
+  assert.match(html, /Operator summary/);
+  assert.match(html, /Run completed and the completion gate cleared\./);
+  assert.match(html, /Completion gate/);
+  assert.match(html, /Guardrails &amp; scope/);
+  assert.match(html, /Iteration ledger/);
+  assert.match(html, /File evidence/);
+  assert.match(html, /Event trace/);
+  assert.match(html, /Raw evidence vault/);
+  assert.match(html, /href="transcripts\/iteration-001-safe\.md"/);
+  assert.match(html, /src\/a\.ts/);
+  assert.match(html, /task-&lt;x&gt;/);
+  assert.doesNotMatch(html, /task-<x>/);
+  assert.doesNotMatch(html, /metric-grid/);
+  assert.ok(html.indexOf("Operator summary") < html.indexOf("Raw evidence vault"));
 });
 
 test("generateStaticRunnerReport escapes summary and message list labels", (t) => {

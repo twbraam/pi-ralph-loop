@@ -1131,7 +1131,9 @@ test("/ralph-logs exports artifacts and static report from a task with .ralph-ru
   assert.doesNotMatch(exportedSummary, /Stale previous summary|secret stale data/);
   assert.equal(readFileSync(join(exportedDir, "transcripts", "one.txt"), "utf8"), "one");
   assert.equal(readFileSync(join(exportedDir, "transcripts", "two.txt"), "utf8"), "two");
-  assert.match(readFileSync(join(exportedDir, "report.html"), "utf8"), /Ralph Run Report/);
+  const reportHtml = readFileSync(join(exportedDir, "report.html"), "utf8");
+  assert.match(reportHtml, /Ralph Loop Dossier/);
+  assert.match(reportHtml, /href="transcripts\/one\.txt"/);
   assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts to ./exported with static report ./exported/report.html")));
 });
 
