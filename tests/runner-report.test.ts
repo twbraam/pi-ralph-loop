@@ -76,6 +76,22 @@ test("generateStaticRunnerReport renders an operator dossier instead of a generi
   assert.ok(html.indexOf("Operator summary") < html.indexOf("Raw evidence vault"));
 });
 
+test("generateStaticRunnerReport renders stopped runs as operator-stopped", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ralph-report-stopped-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  writeFileSync(join(dir, "status.json"), JSON.stringify({ status: "stopped", currentIteration: 2, maxIterations: 5 }), "utf8");
+  writeFileSync(join(dir, "iterations.jsonl"), JSON.stringify({ iteration: 2, status: "stopped", completionGate: { ready: false, reasons: ["operator stopped"] } }) + "\n", "utf8");
+
+  const result = generateStaticRunnerReport(dir);
+  const html = readFileSync(result.reportPath, "utf8");
+
+  assert.match(html, /class="stamp stamp-info">STOPPED<\/strong>/);
+  assert.match(html, /class="status status-info">stopped<\/span>/);
+  assert.match(html, /Run was stopped by operator control after the current iteration\./);
+  assert.doesNotMatch(html, /Run state is unverified/);
+});
+
 test("generateStaticRunnerReport escapes summary and message list labels", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ralph-report-labels-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

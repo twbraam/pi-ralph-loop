@@ -139,7 +139,7 @@ function normalizeStatus(status: unknown): string {
 function statusKind(status: unknown): StatusKind {
   const normalized = normalizeStatus(status);
   if (["complete", "completed", "done", "ok", "success", "ready"].includes(normalized)) return "good";
-  if (["running", "initializing", "started", "in-progress", "progress"].includes(normalized)) return "info";
+  if (["running", "initializing", "started", "in-progress", "progress", "stopped"].includes(normalized)) return "info";
   if (["max-iterations", "no-progress-exhaustion", "blocked", "warning", "warn", "not-checked", "unknown"].includes(normalized)) return "warn";
   if (["error", "failed", "failure", "cancelled", "canceled", "timeout", "timed-out"].includes(normalized)) return "bad";
   return "neutral";
@@ -149,6 +149,7 @@ function stampLabel(status: unknown): string {
   const normalized = normalizeStatus(status);
   if (["complete", "completed", "done", "ok", "success"].includes(normalized)) return "COMPLETE";
   if (["running", "initializing", "started", "in-progress"].includes(normalized)) return "IN PROGRESS";
+  if (normalized === "stopped") return "STOPPED";
   if (normalized === "max-iterations") return "MAX ITERATIONS";
   if (normalized === "no-progress-exhaustion") return "NO PROGRESS";
   if (["timeout", "timed-out"].includes(normalized)) return "TIMEOUT";
@@ -225,6 +226,9 @@ function verdict(status: unknown, gate: GateView): string {
   }
   if (["running", "initializing", "started", "in-progress"].includes(normalized)) {
     return "Run was still in progress when these artifacts were exported.";
+  }
+  if (normalized === "stopped") {
+    return "Run was stopped by operator control after the current iteration.";
   }
   if (normalized === "max-iterations") {
     return "Run exhausted its iteration limit with unresolved work.";
