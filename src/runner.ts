@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -49,7 +49,7 @@ import {
   readFileSync as readFileSyncForSnapshot,
   statSync,
 } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 // --- Types ---
 
@@ -90,6 +90,7 @@ export type RunnerConfig = {
     pi: unknown,
     cwd?: string,
     taskDir?: string,
+    runtimeArgs?: RuntimeArgs,
   ) => Promise<CommandOutput[]>;
   /** Extension API reference for running commands */
   pi?: unknown;
@@ -163,7 +164,7 @@ function logRunnerEvent(taskDir: string, event: RunnerEvent): void {
 
 function readProgressMemory(taskDir: string): string | undefined {
   const progressPath = join(taskDir, RALPH_PROGRESS_FILE);
-  if (!existsSync(progressPath)) return undefined;
+  if (!existsSync(progressPath) || !isRealRegularFileUnderTaskDir(taskDir, RALPH_PROGRESS_FILE)) return undefined;
   try {
     const raw = readFileSync(progressPath, "utf8");
     if (raw.length <= RALPH_PROGRESS_MAX_CHARS) return raw;
@@ -348,10 +349,27 @@ function commandOutcomeRecords(outputs: CommandOutput[]): CommandOutcomeRecord[]
   });
 }
 
-function acceptanceFailureReasons(outcomes: CommandOutcomeRecord[]): string[] {
-  return outcomes
-    .filter((outcome) => outcome.status !== "ok")
-    .map((outcome) => `Acceptance command failed: ${outcome.name} (${outcome.status})`);
+function acceptanceCoverageFailureReasons(commands: CommandDef[], outcomes: CommandOutcomeRecord[]): string[] {
+  const reasons: string[] = [];
+  if (outcomes.length !== commands.length) {
+    reasons.push(`Acceptance command outcome count mismatch: expected ${commands.length}, got ${outcomes.length}`);
+  }
+  const count = Math.min(commands.length, outcomes.length);
+  for (let index = 0; index < count; index += 1) {
+    if (outcomes[index].name !== commands[index].name) {
+      reasons.push(`Acceptance command outcome mismatch: expected ${commands[index].name}, got ${outcomes[index].name}`);
+    }
+  }
+  return reasons;
+}
+
+function acceptanceFailureReasons(commands: CommandDef[], outcomes: CommandOutcomeRecord[]): string[] {
+  return [
+    ...acceptanceCoverageFailureReasons(commands, outcomes),
+    ...outcomes
+      .filter((outcome) => outcome.status !== "ok")
+      .map((outcome) => `Acceptance command failed: ${outcome.name} (${outcome.status})`),
+  ];
 }
 
 export type CompletionReadiness = {
@@ -371,29 +389,71 @@ function collectOpenQuestionsBlockingReasons(raw: string): string[] {
   let currentPriorityDepth = 0;
   let sawP0 = false;
   let sawP1 = false;
+  let checkedParentIndent: number | undefined;
 
-  for (const line of raw.split(/\r?\n/)) {
-    const priorityHeading = line.match(/^(#{1,6})\s+(P0|P1)\b/i);
+  const lines = raw.split(/\r?\n/);
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    const priorityHeading = line.match(/^ {0,3}(#{1,6})\s+(P0|P1)\b/i);
     if (priorityHeading) {
       currentPriority = priorityHeading[2].toUpperCase() as "P0" | "P1";
       currentPriorityDepth = priorityHeading[1].length;
+      checkedParentIndent = undefined;
       continue;
     }
 
-    const heading = line.match(/^(#{1,6})\s+/);
+    const heading = line.match(/^ {0,3}(#{1,6})\s+/);
     if (heading && currentPriority && heading[1].length <= currentPriorityDepth) {
       currentPriority = undefined;
       currentPriorityDepth = 0;
+      checkedParentIndent = undefined;
       continue;
+    }
+
+    const nextLine = lines[lineIndex + 1];
+    const setextUnderline = nextLine?.match(/^ {0,3}(=+|-+)\s*$/);
+    const setextHeading = setextUnderline ? line.match(/^ {0,3}(.+?)\s*$/) : undefined;
+    if (setextUnderline && setextHeading) {
+      const headingText = setextHeading[1].trim();
+      const headingDepth = setextUnderline[1].startsWith("=") ? 1 : 2;
+      const setextPriority = headingText.match(/^(P0|P1)\b/i);
+      if (setextPriority) {
+        currentPriority = setextPriority[1].toUpperCase() as "P0" | "P1";
+        currentPriorityDepth = headingDepth;
+        checkedParentIndent = undefined;
+        lineIndex += 1;
+        continue;
+      }
+      if (currentPriority && headingDepth <= currentPriorityDepth) {
+        currentPriority = undefined;
+        currentPriorityDepth = 0;
+        checkedParentIndent = undefined;
+        lineIndex += 1;
+        continue;
+      }
     }
 
     if (!currentPriority) continue;
 
-    const bullet = line.match(/^(?:[-*+]|\d+\.)\s+(.*)$/);
-    if (!bullet) continue;
+    const bullet = line.match(/^([ \t]*)(?:[-*+]|\d+[.)])\s+(.*)$/);
+    if (!bullet) {
+      if (line.trim().length > 0) checkedParentIndent = undefined;
+      continue;
+    }
 
-    const content = bullet[1].trim();
-    if (!content || /^\[[xX]\]\s*/.test(content)) continue;
+    const indent = bullet[1].length;
+    const content = bullet[2].trim();
+    if (!content) continue;
+    if (checkedParentIndent !== undefined && indent <= checkedParentIndent) {
+      checkedParentIndent = undefined;
+    }
+    const isTaskListItem = /^\[[ xX]\]\s*/.test(content);
+    const isCheckedItem = /^\[[xX]\]\s*/.test(content);
+    if (checkedParentIndent !== undefined && indent > checkedParentIndent && !isTaskListItem) continue;
+    if (isCheckedItem) {
+      checkedParentIndent = indent;
+      continue;
+    }
 
     if (currentPriority === "P0") sawP0 = true;
     if (currentPriority === "P1") sawP1 = true;
@@ -404,20 +464,33 @@ function collectOpenQuestionsBlockingReasons(raw: string): string[] {
   return reasons;
 }
 
+function isRealRegularFileUnderTaskDir(taskDir: string, relativePath: string): boolean {
+  try {
+    const realTaskDir = realpathSync(taskDir);
+    const filePath = join(taskDir, relativePath);
+    if (!lstatSync(filePath).isFile()) return false;
+
+    const realFilePath = realpathSync(filePath);
+    const realRelativePath = relative(realTaskDir, realFilePath);
+    return realRelativePath !== "" && realRelativePath !== ".." && !realRelativePath.startsWith(`..${sep}`) && !isAbsolute(realRelativePath);
+  } catch {
+    return false;
+  }
+}
+
 export function validateCompletionReadiness(taskDir: string, requiredOutputs: string[]): CompletionReadiness {
   const reasons: string[] = [];
 
   for (const requiredOutput of requiredOutputs) {
-    if (basename(requiredOutput) === RALPH_PROGRESS_FILE) continue;
+    if (requiredOutput === RALPH_PROGRESS_FILE) continue;
 
-    const filePath = join(taskDir, requiredOutput);
-    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+    if (!isRealRegularFileUnderTaskDir(taskDir, requiredOutput)) {
       addReadinessReason(reasons, `Missing required output: ${requiredOutput}`);
     }
   }
 
   const openQuestionsPath = join(taskDir, "OPEN_QUESTIONS.md");
-  if (!existsSync(openQuestionsPath) || !statSync(openQuestionsPath).isFile()) {
+  if (!isRealRegularFileUnderTaskDir(taskDir, "OPEN_QUESTIONS.md")) {
     addReadinessReason(reasons, "Missing OPEN_QUESTIONS.md");
   } else {
     try {
@@ -607,7 +680,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
       // Run commands
       const commandsOutput: CommandOutput[] = runCommandsFn && pi
-        ? await runCommandsFn(fm.commands, currentGuardrails, pi, cwd, taskDir)
+        ? await runCommandsFn(fm.commands, currentGuardrails, pi, cwd, taskDir, runtimeArgs)
         : [];
       const commandOutcomes = commandOutcomeRecords(commandsOutput);
       const nonEmptyCommandOutcomes = commandOutcomes.length > 0 ? commandOutcomes : undefined;
@@ -904,10 +977,10 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
               outcomes: [],
             });
           } else {
-            const acceptanceOutputs = await runCommandsFn(acceptanceCommands, currentGuardrails, pi, cwd, taskDir);
+            const acceptanceOutputs = await runCommandsFn(acceptanceCommands, currentGuardrails, pi, cwd, taskDir, runtimeArgs);
             iterEndMs = Date.now();
             const acceptanceOutcomes = commandOutcomeRecords(acceptanceOutputs.map((output) => ({ ...output, acceptance: true })));
-            const acceptanceReasons = acceptanceFailureReasons(acceptanceOutcomes);
+            const acceptanceReasons = acceptanceFailureReasons(acceptanceCommands, acceptanceOutcomes);
             if (completionRecord) {
               completionRecord.acceptanceOutcomes = acceptanceOutcomes;
             }

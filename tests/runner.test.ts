@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -95,6 +95,48 @@ test("runRalphLoop completes a single iteration with mock subprocess", async () 
     assert.ok(result.status === "error" || result.status === "no-progress-exhaustion" || result.status === "max-iterations");
     assert.ok(result.iterations.length >= 1);
     assert.ok(statuses.length > 0);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop preserves cwd/taskDir ABI and appends runtimeArgs to runCommandsFn", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({
+      args: ["owner"],
+      commands: [{ name: "echo", run: "echo {{ args.owner }}", timeout: 1 }],
+      max_iterations: 1,
+    }));
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const calls: Array<{ cwd: string | undefined; taskDir: string | undefined; runtimeArgs: Record<string, string> | undefined }> = [];
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      runtimeArgs: { owner: "Ada" },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async (_commands, _guardrails, _pi, cwd, loopTaskDir, runtimeArgs) => {
+        calls.push({ cwd, taskDir: loopTaskDir, runtimeArgs });
+        return [];
+      },
+      pi: makeMockPi(),
+    });
+
+    assert.deepEqual(calls, [{ cwd: taskDir, taskDir, runtimeArgs: { owner: "Ada" } }]);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
@@ -300,6 +342,49 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
+});
+
+test("runRalphLoop ignores symlinked RALPH_PROGRESS.md", async (t) => {
+  const taskDir = createTempDir();
+  const outsideDir = createTempDir();
+  t.after(() => {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }));
+  const secretPath = join(outsideDir, "secret.txt");
+  writeFileSync(secretPath, "TOP_SECRET_TOKEN\n", "utf8");
+  symlinkSync(secretPath, join(taskDir, "RALPH_PROGRESS.md"));
+
+  const promptPath = join(taskDir, "prompt.json");
+  const scriptPath = join(taskDir, "mock-pi.sh");
+  writeFileSync(
+    scriptPath,
+    `#!/bin/bash
+read line
+printf '%s' "$line" > "${promptPath}"
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+    { mode: 0o755 },
+  );
+
+  await runRalphLoop({
+    ralphPath,
+    cwd: taskDir,
+    timeout: 5,
+    maxIterations: 1,
+    guardrails: { blockCommands: [], protectedFiles: [] },
+    spawnCommand: "bash",
+    spawnArgs: [scriptPath],
+    runCommandsFn: async () => [],
+    pi: makeMockPi(),
+  });
+
+  const prompt = JSON.parse(readFileSync(promptPath, "utf8")) as { message: string };
+  assert.doesNotMatch(prompt.message, /TOP_SECRET_TOKEN/);
+  assert.equal(prompt.message.includes("[RALPH_PROGRESS.md]"), false);
 });
 
 test("runRalphLoop injects pacing controls into every iteration prompt", async () => {
@@ -838,15 +923,58 @@ test("validateCompletionReadiness reports ready when required outputs exist and 
   assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), { ready: true, reasons: [] });
 });
 
-test("validateCompletionReadiness ignores RALPH_PROGRESS.md in required_outputs", (t) => {
+test("validateCompletionReadiness ignores only root RALPH_PROGRESS.md in required_outputs", (t) => {
   const taskDir = createTempDir();
   t.after(() => rmSync(taskDir, { recursive: true, force: true }));
 
   writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
   writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nAll clear.\n", "utf8");
 
-  const readiness = validateCompletionReadiness(taskDir, ["ARCHITECTURE.md", "RALPH_PROGRESS.md"]);
-  assert.deepEqual(readiness, { ready: true, reasons: [] });
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md", "RALPH_PROGRESS.md"]), { ready: true, reasons: [] });
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md", "docs/RALPH_PROGRESS.md"]), {
+    ready: false,
+    reasons: ["Missing required output: docs/RALPH_PROGRESS.md"],
+  });
+});
+
+test("validateCompletionReadiness rejects final symlink required outputs", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.real.md"), "done\n", "utf8");
+  symlinkSync(join(taskDir, "ARCHITECTURE.real.md"), join(taskDir, "ARCHITECTURE.md"));
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nAll clear.\n", "utf8");
+
+  const readiness = validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]);
+  assert.deepEqual(readiness, { ready: false, reasons: ["Missing required output: ARCHITECTURE.md"] });
+});
+
+test("validateCompletionReadiness rejects required outputs through parent symlinks escaping taskDir", (t) => {
+  const taskDir = createTempDir();
+  const externalDir = createTempDir();
+  t.after(() => {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(externalDir, { recursive: true, force: true });
+  });
+
+  writeFileSync(join(externalDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  symlinkSync(externalDir, join(taskDir, "escaped"));
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nAll clear.\n", "utf8");
+
+  const readiness = validateCompletionReadiness(taskDir, ["escaped/ARCHITECTURE.md"]);
+  assert.deepEqual(readiness, { ready: false, reasons: ["Missing required output: escaped/ARCHITECTURE.md"] });
+});
+
+test("validateCompletionReadiness rejects symlinked OPEN_QUESTIONS.md", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.real.md"), "# Open questions\n\nAll clear.\n", "utf8");
+  symlinkSync(join(taskDir, "OPEN_QUESTIONS.real.md"), join(taskDir, "OPEN_QUESTIONS.md"));
+
+  const readiness = validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]);
+  assert.deepEqual(readiness, { ready: false, reasons: ["Missing OPEN_QUESTIONS.md"] });
 });
 
 test("validateCompletionReadiness reports blocking reasons for missing outputs and unresolved questions", (t) => {
@@ -894,6 +1022,143 @@ test("validateCompletionReadiness blocks on any markdown heading level used for 
     assert.equal(readiness.ready, false, label);
     assert.ok(readiness.reasons.includes(expectedReason), label);
   }
+});
+
+test("validateCompletionReadiness handles setext P0 and P1 headings", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "P0\n--\n- [ ] unresolved\n\nP1\n==\n- unresolved\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness closes setext P0 and P1 sections at peer headings", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "   P0\n   --\nDone\n--\n- outside P0\n\nP1\n==\nOther\n==\n- outside P1\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), {
+    ready: true,
+    reasons: [],
+  });
+});
+
+test("validateCompletionReadiness handles indented P0 and P1 headings", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), " # P0\n- [ ] one-space heading\n  ## P1\n- [ ] two-space heading\n   ### Done\n- closed by generic heading\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness handles three-space P0 and P1 headings", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "   ## P0\n- unresolved\n   ## P1\n- unresolved\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness closes indented P0 and P1 sections at peer headings", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "  ## P0\n ## Done\n- outside P0\n   ## P1\n   ## Also done\n1. outside P1\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), {
+    ready: true,
+    reasons: [],
+  });
+});
+
+test("validateCompletionReadiness blocks parenthesized ordered P0 and P1 list items", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n1) unresolved\n## P1\n   1) [ ] unresolved\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, []), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness blocks indented P0 and P1 list items", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n  - [ ] still open\n## P1\n   - [ ] also open\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness blocks indented plain P0 and P1 bullets", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n  - still open\n## P1\n   1. also open\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness blocks deeply indented P0 and P1 bullets", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n    - still open\n        - [ ] task still open\n## P1\n        1. also open\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness blocks open siblings after checked parents", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n  - [x] answered\n- still open\n## P1\n    - [x] answered\n  1. also open\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), {
+    ready: false,
+    reasons: ["OPEN_QUESTIONS.md still has P0 items", "OPEN_QUESTIONS.md still has P1 items"],
+  });
+});
+
+test("validateCompletionReadiness ignores deeply nested note bullets under checked items", (t) => {
+  const taskDir = createTempDir();
+  t.after(() => rmSync(taskDir, { recursive: true, force: true }));
+
+  writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+  writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "## P0\n- [x] answered\n    - supporting note\n## P1\n  - [x] answered\n        1. supporting note\n", "utf8");
+
+  assert.deepEqual(validateCompletionReadiness(taskDir, ["ARCHITECTURE.md"]), {
+    ready: true,
+    reasons: [],
+  });
 });
 
 test("validateCompletionReadiness ignores checked items inside P0 and P1 sections", (t) => {
@@ -1307,7 +1572,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       guardrails: { blockCommands: [], protectedFiles: [] },
       spawnCommand: "bash",
       spawnArgs: [scriptPath],
-      runCommandsFn: async (commands, guardrails, pi, cwd, loopTaskDir) => runCommands(commands, guardrails, pi as any, {}, cwd, loopTaskDir),
+      runCommandsFn: async (commands, guardrails, pi, cwd, loopTaskDir, runtimeArgs) => runCommands(commands, guardrails, pi as any, runtimeArgs ?? {}, cwd, loopTaskDir),
       pi: makeMockPi(),
     });
 
@@ -1361,7 +1626,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       guardrails: { blockCommands: [], protectedFiles: [] },
       spawnCommand: "bash",
       spawnArgs: [scriptPath],
-      runCommandsFn: async (commands, guardrails, pi, cwd, loopTaskDir) => runCommands(commands, guardrails, pi as any, {}, cwd, loopTaskDir),
+      runCommandsFn: async (commands, guardrails, pi, cwd, loopTaskDir, runtimeArgs) => runCommands(commands, guardrails, pi as any, runtimeArgs ?? {}, cwd, loopTaskDir),
       pi: makeMockPi(),
     });
 
@@ -1373,6 +1638,57 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.deepEqual(result.iterations[0].completion?.acceptanceOutcomes, [
       { name: "tests", status: "error", acceptance: true, outputPreview: "[signal SIGTERM]" },
     ]);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop blocks required completion when acceptance command outcome is missing", async () => {
+  const taskDir = createTempDir();
+  try {
+    writeFileSync(join(taskDir, "ARCHITECTURE.md"), "done\n", "utf8");
+    writeFileSync(join(taskDir, "OPEN_QUESTIONS.md"), "# Open questions\n\nNothing open.\n", "utf8");
+    const ralphPath = writeRalphMd(
+      taskDir,
+      minimalRalphMd({
+        commands: [{ name: "tests", run: "npm test", timeout: 5, acceptance: true }],
+        max_iterations: 1,
+        completion_promise: "DONE",
+        required_outputs: ["ARCHITECTURE.md"],
+      }),
+    );
+
+    const scriptPath = join(taskDir, "mock-pi.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+mkdir -p "${taskDir}/notes"
+echo "updated findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"<promise>DONE</promise> All done!"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      completionPromise: "DONE",
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(result.status, "max-iterations");
+    assert.deepEqual(result.iterations[0].completionGate, {
+      ready: false,
+      reasons: ["Acceptance command outcome count mismatch: expected 1, got 0"],
+    });
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
@@ -2053,10 +2369,10 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
       guardrails: { blockCommands: [], protectedFiles: [], shellPolicy: { mode: "allowlist", allow: ["^echo ok$"] } },
       spawnCommand: "bash",
       spawnArgs: [scriptPath],
-      runCommandsFn: async (commands, guardrails, commandPi, cwd, loopTaskDir) => {
+      runCommandsFn: async (commands, guardrails, commandPi, cwd, loopTaskDir, runtimeArgs) => {
         assert.equal(guardrails.shellPolicy?.mode, "allowlist");
         assert.deepEqual(guardrails.shellPolicy?.allow, ["^echo ok$"]);
-        return runCommands(commands, guardrails, commandPi as any, {}, cwd, loopTaskDir);
+        return runCommands(commands, guardrails, commandPi as any, runtimeArgs ?? {}, cwd, loopTaskDir);
       },
       pi: pi as any,
     });

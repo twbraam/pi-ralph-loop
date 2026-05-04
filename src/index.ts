@@ -1821,7 +1821,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         runtimeArgs,
         modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
         thinkingLevel: ctx.model?.reasoning ? "high" : undefined,
-        runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir) => runCommands(commands, guardrails, commandPi as ExtensionAPI, runtimeArgs, cwd, taskDir),
+        runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir, commandRuntimeArgs) => runCommands(commands, guardrails, commandPi as ExtensionAPI, commandRuntimeArgs ?? runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
           const runtimeUi = resolveSessionUi(currentCommandCtx);
           runtimeUi.setStatus("ralph", status === "running" || status === "initializing" ? `🔁 ${name}: running` : undefined);

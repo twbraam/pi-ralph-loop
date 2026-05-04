@@ -136,7 +136,7 @@ function createHarness(options?: {
   // Default mock runner that simulates iterations using the test context's
   // waitForIdle and directory snapshot detection
   const defaultRunLoopFn = async (config: RunnerConfig): Promise<RunnerResult> => {
-    const { ralphPath, cwd, maxIterations, onIterationStart, onIterationComplete, onStatusChange, onNotify, runCommandsFn, pi } = config;
+    const { ralphPath, cwd, maxIterations, onIterationStart, onIterationComplete, onStatusChange, onNotify, runCommandsFn, pi, runtimeArgs = {} } = config;
     const iterations: IterationRecord[] = [];
     let noProgressStreak = 0;
     let finalStatus: RunnerResult["status"] = "max-iterations";
@@ -185,7 +185,7 @@ function createHarness(options?: {
       const runtimeCtx = resolveRuntimeCtx();
 
       if (runCommandsFn && pi) {
-        await runCommandsFn(fm.commands, currentGuardrails, pi, cwd, dirname(ralphPath));
+        await runCommandsFn(fm.commands, currentGuardrails, pi, cwd, dirname(ralphPath), runtimeArgs);
       }
 
       const snapshotBefore = captureTaskDirectorySnapshot(ralphPath);
@@ -1528,6 +1528,7 @@ test("/ralph --path existing-task/RALPH.md with args resolves them safely at run
         config.pi,
         config.cwd,
         dirname(config.ralphPath),
+        config.runtimeArgs ?? {},
       );
       return {
         status: "complete",
