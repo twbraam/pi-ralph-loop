@@ -61,7 +61,22 @@ From an assistant turn, either:
 pi -p "/ralph --path ./task"
 ```
 
-`RALPH.md` frontmatter should use `snake_case` keys. Common camelCase aliases are accepted for compatibility with LLM-authored drafts, but new files should prefer `max_iterations`, `inter_iteration_delay`, `completion_promise`, `completion_gate`, `required_outputs`, `stop_on_error`, `guardrails.block_commands`, and `guardrails.protected_files`.
+For extension-development smoke tests, isolate the run from the user's installed extensions and skills so you test the checkout you intend to test:
+
+```bash
+pi --offline --no-extensions --no-skills \
+  --extension ./src/index.ts \
+  --session-dir /tmp/ralph-smoke-sessions \
+  -p "/ralph --path ./task/RALPH.md"
+```
+
+When authoring `RALPH.md` for a user or for CI-style verification:
+
+- Use `snake_case` frontmatter keys. Common camelCase aliases are accepted for compatibility with LLM-authored drafts, but new files should prefer `max_iterations`, `inter_iteration_delay`, `completion_promise`, `completion_gate`, `required_outputs`, `stop_on_error`, `guardrails.block_commands`, and `guardrails.protected_files`.
+- Remember that normal `commands` run **before** the agent edits files in each iteration. Their output is evidence for the next action, not proof of what the same iteration eventually changed.
+- Mark true final checks with `acceptance: true`. With `completion_gate: required`, Ralph reruns acceptance commands after the completion promise before stopping.
+- For multi-line shell commands, use `set -euo pipefail` or chain checks with `&&`. Plain shell scripts return the status of the last command, so an earlier failing `test` or `grep` can be hidden by a later successful command.
+- If `completion_gate` is `required`, include an `OPEN_QUESTIONS.md` policy in the task: either create one with no remaining P0/P1 items, or set `completion_gate: optional`/`disabled` when that readiness check is not desired.
 
 ## Quick start
 
@@ -218,6 +233,8 @@ reflect_every: 4
 | `{{ ralph.max_iterations }}` | Current max iterations |
 
 Commands starting with `./` run from the task directory. Others run from the project root. Blocked commands produce `[blocked by guardrail: PATTERN]`. Timed-out commands produce `[timed out after Ns]`. Non-zero exits are recorded as `error`. Ralph records each command outcome as `ok`, `blocked`, `timeout`, or `error` in durable iteration metadata with a bounded output preview. Command output included in prompts/transcripts is capped with a truncation marker and byte count.
+
+Normal command output is pre-iteration evidence: it shows what Ralph observed before the agent made that iteration's edits. If you need post-edit proof, mark the command with `acceptance: true` so a required completion gate reruns it after the promise is emitted. For multi-line shell commands, prefer `set -euo pipefail` or `&&` chains so intermediate failures cannot be masked by a later successful command.
 
 ### Goal continuation audits
 
