@@ -1090,7 +1090,7 @@ test("/ralph-scaffold requires a task name", async (t) => {
   assert.deepEqual(notifications, [{ message: "/ralph-scaffold expects a task name or path.", level: "error" }]);
 });
 
-test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) => {
+test("/ralph-logs exports artifacts and static report from a task with .ralph-runner/", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
 
@@ -1120,7 +1120,7 @@ test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) 
     sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
   };
 
-  await handler("my-task --dest exported", ctx);
+  await handler("my-task --dest exported --report", ctx);
 
   const exportedDir = join(cwd, "exported");
   assert.equal(existsSync(join(exportedDir, "status.json")), true);
@@ -1131,7 +1131,10 @@ test("/ralph-logs exports artifacts from a task with .ralph-runner/", async (t) 
   assert.doesNotMatch(exportedSummary, /Stale previous summary|secret stale data/);
   assert.equal(readFileSync(join(exportedDir, "transcripts", "one.txt"), "utf8"), "one");
   assert.equal(readFileSync(join(exportedDir, "transcripts", "two.txt"), "utf8"), "two");
-  assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts to ./exported")));
+  const reportHtml = readFileSync(join(exportedDir, "report.html"), "utf8");
+  assert.match(reportHtml, /Ralph Loop Dossier/);
+  assert.match(reportHtml, /href="transcripts\/one\.txt"/);
+  assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts to ./exported with static report ./exported/report.html")));
 });
 
 test("/ralph-logs fails when no .ralph-runner/ exists", async (t) => {
@@ -1165,6 +1168,7 @@ test("/ralph-logs fails when no .ralph-runner/ exists", async (t) => {
 
 test("parseLogExportArgs parses --dest and quoted paths correctly", () => {
   assert.deepEqual(parseLogExportArgs("my-task --dest exported"), { path: "my-task", dest: "exported" });
+  assert.deepEqual(parseLogExportArgs("my-task --dest exported --report"), { path: "my-task", dest: "exported", report: true });
   assert.deepEqual(parseLogExportArgs('"my task" --dest "export dir"'), { path: "my task", dest: "export dir" });
   assert.deepEqual(parseLogExportArgs('"unterminated'), { error: "Unterminated quote in /ralph-logs arguments." });
 });
@@ -1315,7 +1319,7 @@ test("/ralph-logs rejects non-empty destinations instead of using stale artifact
   assert.equal(existsSync(join(cwd, "exported", "status.json")), false);
 });
 
-test("/ralph-logs does not overwrite symlinked destination final summaries", async (t) => {
+test("/ralph-logs rejects non-empty destination with symlinked final summary without overwriting it", async (t) => {
   const cwd = createTempDir();
   const outside = createTempDir();
   t.after(() => {
@@ -1352,7 +1356,7 @@ test("/ralph-logs does not overwrite symlinked destination final summaries", asy
   assert.equal(readFileSync(outsideFile, "utf8"), "do not overwrite");
 });
 
-test("/ralph-logs does not overwrite symlinked destination transcript entries", async (t) => {
+test("/ralph-logs rejects non-empty destination with symlinked transcript without overwriting it", async (t) => {
   const cwd = createTempDir();
   const outside = createTempDir();
   t.after(() => {
@@ -1496,6 +1500,7 @@ test("/ralph-logs exports only records for the current loop token when status ha
   assert.equal(readFileSync(join(exportedDir, "events.jsonl"), "utf8"), `${JSON.stringify({ type: "iteration.completed", loopToken: "current-token" })}\n`);
   assert.equal(existsSync(join(exportedDir, "transcripts", "iteration-001-stale-token.md")), false);
   assert.equal(readFileSync(join(exportedDir, "transcripts", "iteration-002-current-token.md"), "utf8"), "current");
+
 });
 
 test("/ralph-logs excludes runtime control files", async (t) => {

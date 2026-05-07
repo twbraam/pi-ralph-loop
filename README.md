@@ -236,7 +236,7 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 | `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
 | `/ralph-cancel [task folder or RALPH.md]` | Kill the current iteration immediately |
 | `/ralph-scaffold [--preset <name>] <name-or-path>` | Create a starter `RALPH.md` template |
-| `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>]` | Export run artifacts to a directory |
+| `/ralph-logs [<task folder or RALPH.md>] [--path <task folder or RALPH.md>] [--dest <dir>] [--report]` | Export run artifacts to a directory; optionally add a static HTML report |
 
 Ralph runs each iteration in a child `pi --mode rpc` process. The child explicitly loads the Ralph extension but disables normal Pi extension discovery, so unrelated local extensions or MCP gateways do not slow or alter loop startup.
 
@@ -426,7 +426,7 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass
 
 `/ralph-status --summary <task>` builds a deterministic summary from `RALPH.md`, `RALPH_PROGRESS.md`, durable status, iteration/event JSONL, and transcript references. It is intended for handoff, review, and compaction-safe context without relying on an LLM summary.
 
-`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, `final-summary.md`, and `transcripts/` to a new or empty destination directory. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
+`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, and `transcripts/` to a new or empty destination directory, then generates a fresh `final-summary.md`. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Add `--report` to generate `report.html`, an escaped static HTML view derived from the copied artifacts. JSONL files remain canonical; there is no server or SSE dependency. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
 
 ## Termination statuses
 

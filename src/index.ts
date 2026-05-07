@@ -34,6 +34,7 @@ import type { CommandDef, CommandOutput, DraftPlan, DraftTarget, Frontmatter, Ru
 import { createDraftPlan as createDraftPlanService } from "./ralph-draft.ts";
 import type { StrengthenDraftRuntime } from "./ralph-draft-llm.ts";
 import { runRalphLoop } from "./runner.ts";
+import { generateStaticRunnerReport } from "./runner-report.ts";
 import { buildRalphRunSummary } from "./runner-summary.ts";
 import {
   checkStopSignal,
@@ -1480,7 +1481,7 @@ function countNonEmptyLines(filePath: string): number {
   return readFileSync(filePath, "utf8").split("\n").filter((line) => line.trim()).length;
 }
 
-function exportRalphLogs(taskDir: string, destDir: string): { iterations: number; events: number; transcripts: number } {
+function exportRalphLogs(taskDir: string, destDir: string, options: { report?: boolean } = {}): { iterations: number; events: number; transcripts: number; reportPath?: string } {
   assertNoSymlinkedExistingPathSegments(taskDir, "task path");
   const runnerDir = join(taskDir, ".ralph-runner");
   assertNoSymlinkedExistingPathSegments(runnerDir, ".ralph-runner path");
@@ -1547,12 +1548,19 @@ function exportRalphLogs(taskDir: string, destDir: string): { iterations: number
       }
     }
 
+    let reportPath: string | undefined;
+    if (options.report) {
+      generateStaticRunnerReport(preparedDest.stagingDir);
+      reportPath = join(preparedDest.finalDestDir, "report.html");
+    }
+
     const iterations = countNonEmptyLines(join(preparedDest.stagingDir, "iterations.jsonl"));
     const events = countNonEmptyLines(join(preparedDest.stagingDir, "events.jsonl"));
 
     finalizeExportDirectory(preparedDest);
     finalized = true;
-    return { iterations, events, transcripts };
+
+    return { iterations, events, transcripts, ...(reportPath ? { reportPath } : {}) };
   } finally {
     if (!finalized) {
       rmSync(preparedDest.stagingDir, { recursive: true, force: true });
@@ -1560,15 +1568,19 @@ function exportRalphLogs(taskDir: string, destDir: string): { iterations: number
   }
 }
 
-export function parseLogExportArgs(raw: string): { path?: string; dest?: string; error?: string } {
+export function parseLogExportArgs(raw: string): { path?: string; dest?: string; report?: boolean; error?: string } {
   const tokenized = tokenizeScaffoldArgs(raw);
   if (tokenized.error) return { error: tokenized.error.replace("/ralph-scaffold", "/ralph-logs") };
   const parts = tokenized.tokens;
   let path: string | undefined;
   let dest: string | undefined;
+  let report = false;
   let i = 0;
   while (i < parts.length) {
-    if (parts[i] === "--dest" || parts[i] === "-d") {
+    if (parts[i] === "--report") {
+      report = true;
+      i++;
+    } else if (parts[i] === "--dest" || parts[i] === "-d") {
       if (i + 1 >= parts.length) return { error: "--dest requires a directory path" };
       dest = parts[i + 1];
       i += 2;
@@ -1583,7 +1595,7 @@ export function parseLogExportArgs(raw: string): { path?: string; dest?: string;
       i++;
     }
   }
-  return { path, dest };
+  return { path, dest, ...(report ? { report } : {}) };
 }
 
 async function promptForTask(ctx: Pick<CommandContext, "hasUI" | "ui">, title: string, placeholder: string): Promise<string | undefined> {
@@ -2838,8 +2850,9 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         : join(ctx.cwd, `ralph-logs-${new Date().toISOString().replace(/[:.]/g, "-")}`);
 
       try {
-        const result = exportRalphLogs(taskDir, destDir);
-        ctx.ui.notify(`Exported ${result.iterations} iteration records, ${result.events} events, ${result.transcripts} transcripts to ${displayPath(ctx.cwd, destDir)}`, "info");
+        const result = exportRalphLogs(taskDir, destDir, { report: parsed.report });
+        const reportNote = result.reportPath ? ` with static report ${displayPath(ctx.cwd, result.reportPath)}` : "";
+        ctx.ui.notify(`Exported ${result.iterations} iteration records, ${result.events} events, ${result.transcripts} transcripts to ${displayPath(ctx.cwd, destDir)}${reportNote}`, "info");
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Log export failed: ${message}`, "error");
