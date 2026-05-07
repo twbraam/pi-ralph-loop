@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/pi-ralph-loop.png" alt="pi-ralph-loop autonomous coding loop hero image" width="900">
+</p>
+
 # pi-ralph-loop
 
 Autonomous coding loops for [pi](https://github.com/mariozechner/pi-coding-agent).

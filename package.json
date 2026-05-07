@@ -45,6 +45,7 @@
   "license": "MIT",
   "files": [
     "README.md",
+    "assets",
     "examples",
     "presets",
     "skills",
