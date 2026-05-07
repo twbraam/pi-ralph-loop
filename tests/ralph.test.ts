@@ -1015,20 +1015,27 @@ test("parseCommandArgs handles explicit path args, leaves task text alone, and r
     runtimeArgs: [],
     error: undefined,
   });
-  assert.deepEqual(parseCommandArgs("--path my --argument task"), {
-    mode: "path",
-    value: "my --argument task",
-    runtimeArgs: [],
-    error: undefined,
-  });
+  assert.equal(parseCommandArgs("--path my --argument task").error, "Invalid --path syntax: use quotes for paths containing spaces");
   assert.equal(parseCommandArgs("--task reverse engineer auth --arg owner=Ada").error, "--arg is only supported with /ralph --path");
 });
 
-test("parseCommandArgs parses quoted explicit-path args and preserves literal equals", () => {
+test("parseCommandArgs parses quoted explicit paths and args and preserves literal equals", () => {
+  assert.deepEqual(parseCommandArgs('--path "my task/RALPH.md"'), {
+    mode: "path",
+    value: "my task/RALPH.md",
+    runtimeArgs: [],
+    error: undefined,
+  });
   assert.deepEqual(parseCommandArgs('--path "task with spaces" --arg owner=Ada'), {
     mode: "path",
     value: "task with spaces",
     runtimeArgs: [{ name: "owner", value: "Ada" }],
+    error: undefined,
+  });
+  assert.deepEqual(parseCommandArgs('--path="my task/RALPH.md" --arg owner="Ada Lovelace"'), {
+    mode: "path",
+    value: "my task/RALPH.md",
+    runtimeArgs: [{ name: "owner", value: "Ada Lovelace" }],
     error: undefined,
   });
   assert.deepEqual(parseCommandArgs('--path my-task --arg owner="Ada Lovelace"'), {
@@ -1066,7 +1073,7 @@ test("parseCommandArgs rejects malformed explicit-path args", () => {
   );
   assert.equal(
     parseCommandArgs("--path my-task --argowner=Ada").error,
-    "Invalid --arg syntax: values must be a single token and no trailing text is allowed",
+    "Invalid --path syntax: use quotes for paths containing spaces",
   );
   assert.equal(
     parseCommandArgs('--path my-task --arg owner="Ada"extra').error,
@@ -1121,7 +1128,7 @@ test("explicit path mode stays path-centric and does not offer task fallback", a
     waitForIdle: async () => undefined,
   };
 
-  await handler("--path reverse engineer auth", ctx);
+  await handler('--path "reverse engineer auth"', ctx);
 
   assert.deepEqual(selectOptions, [["Draft in that folder", "Cancel"]]);
 });

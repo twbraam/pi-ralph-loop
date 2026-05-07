@@ -230,7 +230,7 @@ Every Ralph iteration now includes goal-continuation steering: the agent sees el
 | `/ralph [path-or-task]` | Start or draft+start a loop |
 | `/ralph-draft [path-or-task]` | Create or edit a draft without starting |
 | `/ralph-list` | List active loops |
-| `/ralph-status [path]` | Show durable status and the latest iteration summary |
+| `/ralph-status [path] [--summary]` | Show durable status and the latest iteration summary; `--summary` renders a deterministic run summary |
 | `/ralph-resume <path>` | Start a new run from an existing `RALPH.md` |
 | `/ralph-archive <path>` | Move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/` |
 | `/ralph-stop [task folder or RALPH.md]` | Finish current iteration, then stop |
@@ -418,12 +418,15 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass
 | `status.json` | Current loop state (status, iteration, guardrails, timing) |
 | `iterations.jsonl` | Append-only iteration records |
 | `events.jsonl` | Append-only runner events (progress, gates, starts, finishes) |
+| `final-summary.md` | Deterministic summary written when a run reaches a terminal state |
 | `transcripts/` | Per-iteration markdown transcripts |
 | `active-loops/` | Registry of running loops (pruned after 30 minutes) |
 
 ### Log export
 
-`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, and `transcripts/` to a destination directory. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
+`/ralph-status --summary <task>` builds a deterministic summary from `RALPH.md`, `RALPH_PROGRESS.md`, durable status, iteration/event JSONL, and transcript references. It is intended for handoff, review, and compaction-safe context without relying on an LLM summary.
+
+`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, `final-summary.md`, and `transcripts/` to a new or empty destination directory. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
 
 ## Termination statuses
 

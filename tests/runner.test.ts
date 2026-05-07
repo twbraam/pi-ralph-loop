@@ -2008,6 +2008,7 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.ok(records[0].durationMs !== undefined && records[0].durationMs >= 0);
     assert.ok(records[0].startedAt.length > 0);
     assert.ok(records[0].completedAt !== undefined && records[0].completedAt.length > 0);
+    assert.match(readFileSync(join(taskDir, ".ralph-runner", "final-summary.md"), "utf8"), /^# Ralph Run Summary/);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }
@@ -2136,6 +2137,53 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     assert.equal(result.iterations.length, 1);
     // With progress but max_iterations reached, could be either max-iterations or complete
     assert.ok(["max-iterations", "no-progress-exhaustion", "complete", "error"].includes(result.status));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop final status reflects live-edited runtime config", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 2, timeout: 5 }));
+
+    const scriptPath = join(taskDir, "mock-pi-edit-config.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+if [ "$RALPH_RUNNER_CURRENT_ITERATION" = "1" ]; then
+  cat > "${taskDir}/RALPH.md" <<'RALPH'
+---
+commands: []
+max_iterations: 1
+timeout: 7
+guardrails: {"block_commands":[],"protected_files":[]}
+---
+Task: Do something
+RALPH
+fi
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 2,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    const status = readStatusFile(taskDir);
+    assert.equal(status?.maxIterations, 1);
+    assert.equal(status?.timeout, 7);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

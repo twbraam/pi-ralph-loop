@@ -161,7 +161,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   let modelProvider = explicitProvider;
   let modelModelId = explicitModelId;
   let thinkingLevel = config.thinkingLevel;
-  if (modelPattern && !explicitModelId) {
+  if (modelPattern) {
     // Extract thinking level suffix (e.g. ":high")
     const lastColonIdx = modelPattern.lastIndexOf(":");
     const validThinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
@@ -173,8 +173,8 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
     
     const slashIdx = patternWithoutThinking.indexOf("/");
     if (slashIdx > 0) {
-      modelProvider = patternWithoutThinking.slice(0, slashIdx);
-      modelModelId = patternWithoutThinking.slice(slashIdx + 1);
+      if (!explicitProvider) modelProvider = patternWithoutThinking.slice(0, slashIdx);
+      if (!explicitModelId) modelModelId = patternWithoutThinking.slice(slashIdx + 1);
     }
   }
 
