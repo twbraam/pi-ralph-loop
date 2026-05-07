@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join, parse as parsePath, resolve } from "node:path";
 
 export type StaticRunnerReportResult = {
@@ -11,7 +11,7 @@ type JsonRecord = Record<string, unknown>;
 type StatusKind = "good" | "info" | "warn" | "bad" | "neutral";
 
 const REPORT_ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024;
-const REPORT_JSONL_MAX_RECORDS = 500;
+const REPORT_JSONL_MAX_RECORDS = 200;
 
 type ParsedJsonl = {
   records: JsonRecord[];
@@ -77,18 +77,57 @@ function assertNoSymlinkedExistingPathSegments(targetPath: string, label: string
 
 function readArtifact(path: string, maxBytes = REPORT_ARTIFACT_PREVIEW_MAX_BYTES): ArtifactText {
   if (!existsSync(path)) return { text: "", truncated: false, originalBytes: 0 };
+  let fd: number | undefined;
   try {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) return { text: "", truncated: false, originalBytes: 0 };
-    const data = readFileSync(path);
-    if (data.length <= maxBytes) return { text: data.toString("utf8"), truncated: false, originalBytes: data.length };
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    fd = openSync(path, fsConstants.O_RDONLY | noFollow);
+    const bytesToRead = Math.min(stat.size, maxBytes);
+    const buffer = Buffer.alloc(bytesToRead);
+    const bytesRead = bytesToRead > 0 ? readSync(fd, buffer, 0, bytesToRead, 0) : 0;
     return {
-      text: data.subarray(0, maxBytes).toString("utf8"),
-      truncated: true,
-      originalBytes: data.length,
+      text: buffer.toString("utf8", 0, bytesRead),
+      truncated: stat.size > maxBytes,
+      originalBytes: stat.size,
     };
   } catch {
     return { text: "", truncated: false, originalBytes: 0 };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function countNonEmptyLines(path: string): number {
+  if (!existsSync(path)) return 0;
+  let fd: number | undefined;
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) return 0;
+    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+    fd = openSync(path, fsConstants.O_RDONLY | noFollow);
+    const buffer = Buffer.alloc(64 * 1024);
+    let count = 0;
+    let currentLineHasContent = false;
+    while (true) {
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      const chunk = buffer.toString("utf8", 0, bytesRead);
+      for (const char of chunk) {
+        if (char === "\n") {
+          if (currentLineHasContent) count += 1;
+          currentLineHasContent = false;
+        } else if (!/\s/.test(char)) {
+          currentLineHasContent = true;
+        }
+      }
+    }
+    if (currentLineHasContent) count += 1;
+    return count;
+  } catch {
+    return 0;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -590,7 +629,7 @@ pre { margin: 0; padding: 14px; overflow: auto; background: #29251f; color: #f6e
 @media print { body { background: white; } .dossier-page { display: block; max-width: none; padding: 0; } .toc { display: none; } .cover, .section { box-shadow: none; break-inside: avoid; } a { color: black; } }`;
 }
 
-function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iterationsArtifact: ArtifactText, eventsArtifact: ArtifactText, iterationLines: string[], eventLines: string[]): string {
+function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iterationsArtifact: ArtifactText, eventsArtifact: ArtifactText, iterationLines: string[], eventLines: string[], totalIterations: number, totalEvents: number): string {
   const statusText = statusArtifact.text;
   const iterationsJsonl = iterationsArtifact.text;
   const eventsJsonl = eventsArtifact.text;
@@ -611,8 +650,8 @@ function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iteration
   const overviewFacts = renderFactGrid([
     { label: "Case ID", value: stringValue(status.loopToken, "unrecorded") },
     { label: "Terminal status", value: statusBadge(currentStatus), html: true },
-    { label: "Iterations", value: `${String(currentIteration)} / ${String(maxIterations)}` },
-    { label: "Events recorded", value: String(eventLines.length) },
+    { label: "Iterations", value: `${String(currentIteration)} / ${String(maxIterations)} (${totalIterations} record${totalIterations === 1 ? "" : "s"} exported)` },
+    { label: "Events recorded", value: String(totalEvents) },
     { label: "Started", value: formatTime(status.startedAt) },
     { label: "Completed", value: formatTime(status.completedAt) },
     { label: "Duration", value: duration },
@@ -703,11 +742,15 @@ export function generateStaticRunnerReport(artifactsDir: string, reportName = "r
   const status = readArtifact(join(artifactsDir, "status.json"));
   const iterationsJsonl = readArtifact(join(artifactsDir, "iterations.jsonl"));
   const eventsJsonl = readArtifact(join(artifactsDir, "events.jsonl"));
+  const iterationsPath = join(artifactsDir, "iterations.jsonl");
+  const eventsPath = join(artifactsDir, "events.jsonl");
   const iterationLines = nonEmptyLines(iterationsJsonl.text);
   const eventLines = nonEmptyLines(eventsJsonl.text);
+  const totalIterations = countNonEmptyLines(iterationsPath);
+  const totalEvents = countNonEmptyLines(eventsPath);
   const reportPath = join(artifactsDir, reportName);
-  const html = buildHtml(artifactsDir, status, iterationsJsonl, eventsJsonl, iterationLines, eventLines);
+  const html = buildHtml(artifactsDir, status, iterationsJsonl, eventsJsonl, iterationLines, eventLines, totalIterations, totalEvents);
 
   writeFileSync(reportPath, html, { encoding: "utf8", flag: "wx" });
-  return { reportPath, iterations: iterationLines.length, events: eventLines.length };
+  return { reportPath, iterations: totalIterations, events: totalEvents };
 }
