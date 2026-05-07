@@ -157,6 +157,24 @@ test("generateStaticRunnerReport refuses to overwrite symlinked report files", (
   assert.equal(readFileSync(target, "utf8"), "do not overwrite");
 });
 
+test("generateStaticRunnerReport bounds large inline JSONL previews", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ralph-report-large-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const lines = Array.from({ length: 1200 }, (_, index) => JSON.stringify({ iteration: index + 1, summary: `large-${index}-${"x".repeat(300)}` }));
+  writeFileSync(join(dir, "iterations.jsonl"), `${lines.join("\n")}\n`, "utf8");
+  writeFileSync(join(dir, "events.jsonl"), `${lines.map((line, index) => JSON.stringify({ type: "event", index, payload: line })).join("\n")}\n`, "utf8");
+
+  const result = generateStaticRunnerReport(dir);
+  const html = readFileSync(result.reportPath, "utf8");
+
+  assert.equal(result.iterations, 1200);
+  assert.match(html, /preview truncated/);
+  assert.match(html, /omitted from parsed report cards after 500 records/);
+  assert.match(html, /canonical exported file remains complete/);
+  assert.ok(Buffer.byteLength(html, "utf8") < 900_000);
+});
+
 test("generateStaticRunnerReport rejects path-like report names", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ralph-report-name-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

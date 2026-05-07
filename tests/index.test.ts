@@ -1319,7 +1319,7 @@ test("/ralph-logs rejects non-empty destinations instead of using stale artifact
   assert.equal(existsSync(join(cwd, "exported", "status.json")), false);
 });
 
-test("/ralph-logs does not overwrite symlinked destination final summaries", async (t) => {
+test("/ralph-logs rejects non-empty destination with symlinked final summary without overwriting it", async (t) => {
   const cwd = createTempDir();
   const outside = createTempDir();
   t.after(() => {
@@ -1356,7 +1356,7 @@ test("/ralph-logs does not overwrite symlinked destination final summaries", asy
   assert.equal(readFileSync(outsideFile, "utf8"), "do not overwrite");
 });
 
-test("/ralph-logs does not overwrite symlinked destination transcript entries", async (t) => {
+test("/ralph-logs rejects non-empty destination with symlinked transcript without overwriting it", async (t) => {
   const cwd = createTempDir();
   const outside = createTempDir();
   t.after(() => {

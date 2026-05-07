@@ -10,9 +10,19 @@ export type StaticRunnerReportResult = {
 type JsonRecord = Record<string, unknown>;
 type StatusKind = "good" | "info" | "warn" | "bad" | "neutral";
 
+const REPORT_ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024;
+const REPORT_JSONL_MAX_RECORDS = 500;
+
 type ParsedJsonl = {
   records: JsonRecord[];
   invalidLines: number;
+  omittedLines: number;
+};
+
+type ArtifactText = {
+  text: string;
+  truncated: boolean;
+  originalBytes: number;
 };
 
 type Fact = {
@@ -65,14 +75,20 @@ function assertNoSymlinkedExistingPathSegments(targetPath: string, label: string
   }
 }
 
-function readArtifact(path: string): string {
-  if (!existsSync(path)) return "";
+function readArtifact(path: string, maxBytes = REPORT_ARTIFACT_PREVIEW_MAX_BYTES): ArtifactText {
+  if (!existsSync(path)) return { text: "", truncated: false, originalBytes: 0 };
   try {
     const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) return "";
-    return readFileSync(path, "utf8");
+    if (!stat.isFile() || stat.isSymbolicLink()) return { text: "", truncated: false, originalBytes: 0 };
+    const data = readFileSync(path);
+    if (data.length <= maxBytes) return { text: data.toString("utf8"), truncated: false, originalBytes: data.length };
+    return {
+      text: data.subarray(0, maxBytes).toString("utf8"),
+      truncated: true,
+      originalBytes: data.length,
+    };
   } catch {
-    return "";
+    return { text: "", truncated: false, originalBytes: 0 };
   }
 }
 
@@ -93,8 +109,13 @@ function parseObject(value: string): JsonRecord | null {
 function parseJsonl(lines: string[]): ParsedJsonl {
   const records: JsonRecord[] = [];
   let invalidLines = 0;
+  let omittedLines = 0;
 
   for (const line of lines) {
+    if (records.length >= REPORT_JSONL_MAX_RECORDS) {
+      omittedLines += 1;
+      continue;
+    }
     const parsed = parseObject(line);
     if (parsed) {
       records.push(parsed);
@@ -103,7 +124,7 @@ function parseJsonl(lines: string[]): ParsedJsonl {
     }
   }
 
-  return { records, invalidLines };
+  return { records, invalidLines, omittedLines };
 }
 
 function stringValue(value: unknown, fallback = "—"): string {
@@ -450,16 +471,22 @@ function renderArtifactLinks(transcripts: string[]): string {
   </div>`;
 }
 
-function renderRawArtifact(name: string, text: string, missing: string): string {
+function artifactDisplayText(artifact: ArtifactText, missing: string): string {
+  if (!artifact.text) return missing;
+  if (!artifact.truncated) return artifact.text;
+  return `${artifact.text}\n\n[truncated to first ${REPORT_ARTIFACT_PREVIEW_MAX_BYTES} bytes from ${artifact.originalBytes} bytes; canonical exported file remains complete]`;
+}
+
+function renderRawArtifact(name: string, artifact: ArtifactText, missing: string): string {
   return `<details class="raw-file">
-  <summary>${escapeHtml(name)}</summary>
-  <pre><code>${escapeHtml(text || missing)}</code></pre>
+  <summary>${escapeHtml(name)}${artifact.truncated ? " (preview truncated)" : ""}</summary>
+  <pre><code>${escapeHtml(artifactDisplayText(artifact, missing))}</code></pre>
 </details>`;
 }
 
-function renderRawVault(statusText: string, iterationsJsonl: string, eventsJsonl: string, transcripts: string[]): string {
+function renderRawVault(status: ArtifactText, iterationsJsonl: ArtifactText, eventsJsonl: ArtifactText, transcripts: string[]): string {
   return `${renderArtifactLinks(transcripts)}
-${renderRawArtifact("status.json", statusText, "No status.json exported.")}
+${renderRawArtifact("status.json", status, "No status.json exported.")}
 ${renderRawArtifact("iterations.jsonl", iterationsJsonl, "No iterations.jsonl exported.")}
 ${renderRawArtifact("events.jsonl", eventsJsonl, "No events.jsonl exported.")}`;
 }
@@ -563,7 +590,10 @@ pre { margin: 0; padding: 14px; overflow: auto; background: #29251f; color: #f6e
 @media print { body { background: white; } .dossier-page { display: block; max-width: none; padding: 0; } .toc { display: none; } .cover, .section { box-shadow: none; break-inside: avoid; } a { color: black; } }`;
 }
 
-function buildHtml(artifactsDir: string, statusText: string, iterationsJsonl: string, eventsJsonl: string, iterationLines: string[], eventLines: string[]): string {
+function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iterationsArtifact: ArtifactText, eventsArtifact: ArtifactText, iterationLines: string[], eventLines: string[]): string {
+  const statusText = statusArtifact.text;
+  const iterationsJsonl = iterationsArtifact.text;
+  const eventsJsonl = eventsArtifact.text;
   const status = parseObject(statusText) ?? {};
   const parsedIterations = parseJsonl(iterationLines);
   const parsedEvents = parseJsonl(eventLines);
@@ -606,6 +636,10 @@ function buildHtml(artifactsDir: string, statusText: string, iterationsJsonl: st
   const malformedNotes = [
     parsedIterations.invalidLines > 0 ? renderCallout("warn", `${parsedIterations.invalidLines} iterations.jsonl line(s) could not be parsed. Raw artifact text is preserved below.`) : "",
     parsedEvents.invalidLines > 0 ? renderCallout("warn", `${parsedEvents.invalidLines} events.jsonl line(s) could not be parsed. Raw artifact text is preserved below.`) : "",
+    parsedIterations.omittedLines > 0 ? renderCallout("warn", `${parsedIterations.omittedLines} iterations.jsonl line(s) omitted from parsed report cards after ${REPORT_JSONL_MAX_RECORDS} records; canonical exported file remains complete.`) : "",
+    parsedEvents.omittedLines > 0 ? renderCallout("warn", `${parsedEvents.omittedLines} events.jsonl line(s) omitted from parsed event trace after ${REPORT_JSONL_MAX_RECORDS} records; canonical exported file remains complete.`) : "",
+    iterationsArtifact.truncated ? renderCallout("warn", `iterations.jsonl inline preview truncated to ${REPORT_ARTIFACT_PREVIEW_MAX_BYTES} bytes; canonical exported file remains complete.`) : "",
+    eventsArtifact.truncated ? renderCallout("warn", `events.jsonl inline preview truncated to ${REPORT_ARTIFACT_PREVIEW_MAX_BYTES} bytes; canonical exported file remains complete.`) : "",
   ].join("\n");
 
   return `<!doctype html>
@@ -648,7 +682,7 @@ function buildHtml(artifactsDir: string, statusText: string, iterationsJsonl: st
       ${renderSection("iterations", "Iteration ledger", renderIterationCards(iterations), "One ledger card per iteration. Status labels are derived from exported runner records.")}
       ${renderSection("files", "File evidence", renderFileEvidence(iterations), "Aggregate changed-file evidence from the iteration ledger.")}
       ${renderSection("events", "Event trace", renderEventTrace(events, parsedEvents.invalidLines), "Chronological runner events. Event names are preserved exactly as recorded.")}
-      ${renderSection("raw", "Raw evidence vault", renderRawVault(statusText, iterationsJsonl, eventsJsonl, transcripts), "Canonical copied artifacts and transcripts. Inline text is escaped and preserved for audit.")}
+      ${renderSection("raw", "Raw evidence vault", renderRawVault(statusArtifact, iterationsArtifact, eventsArtifact, transcripts), "Canonical copied artifacts and transcripts. Inline report previews are escaped and bounded for audit.")}
     </div>
   </main>
 </body>
@@ -669,8 +703,8 @@ export function generateStaticRunnerReport(artifactsDir: string, reportName = "r
   const status = readArtifact(join(artifactsDir, "status.json"));
   const iterationsJsonl = readArtifact(join(artifactsDir, "iterations.jsonl"));
   const eventsJsonl = readArtifact(join(artifactsDir, "events.jsonl"));
-  const iterationLines = nonEmptyLines(iterationsJsonl);
-  const eventLines = nonEmptyLines(eventsJsonl);
+  const iterationLines = nonEmptyLines(iterationsJsonl.text);
+  const eventLines = nonEmptyLines(eventsJsonl.text);
   const reportPath = join(artifactsDir, reportName);
   const html = buildHtml(artifactsDir, status, iterationsJsonl, eventsJsonl, iterationLines, eventLines);
 

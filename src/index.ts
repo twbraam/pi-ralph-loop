@@ -1548,16 +1548,17 @@ function exportRalphLogs(taskDir: string, destDir: string, options: { report?: b
       }
     }
 
+    let reportPath: string | undefined;
+    if (options.report) {
+      generateStaticRunnerReport(preparedDest.stagingDir);
+      reportPath = join(preparedDest.finalDestDir, "report.html");
+    }
+
     const iterations = countNonEmptyLines(join(preparedDest.stagingDir, "iterations.jsonl"));
     const events = countNonEmptyLines(join(preparedDest.stagingDir, "events.jsonl"));
 
-    const finalDestDir = finalizeExportDirectory(preparedDest);
+    finalizeExportDirectory(preparedDest);
     finalized = true;
-
-    let reportPath: string | undefined;
-    if (options.report) {
-      reportPath = generateStaticRunnerReport(finalDestDir).reportPath;
-    }
 
     return { iterations, events, transcripts, ...(reportPath ? { reportPath } : {}) };
   } finally {
