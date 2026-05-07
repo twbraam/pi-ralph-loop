@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -102,6 +102,66 @@ test("ensureRunnerDir is idempotent", () => {
   }
 });
 
+test("runner readers ignore a symlinked .ralph-runner root", () => {
+  const root = createTempDir();
+  try {
+    const taskDir = join(root, "task");
+    const outsideDir = join(root, "outside");
+    mkdirSync(taskDir);
+    mkdirSync(outsideDir);
+    writeFileSync(join(outsideDir, "status.json"), `${JSON.stringify(makeStatusFile({ taskDir }))}\n`, "utf8");
+    writeFileSync(join(outsideDir, "iterations.jsonl"), `${JSON.stringify(makeIterationRecord({ loopToken: "outside" }))}\n`, "utf8");
+    writeFileSync(join(outsideDir, "events.jsonl"), `${JSON.stringify({ type: "runner.finished", timestamp: new Date().toISOString(), loopToken: "outside", status: "complete", iterations: 1, totalDurationMs: 1 } satisfies RunnerEvent)}\n`, "utf8");
+    writeFileSync(join(outsideDir, "stop.flag"), "", "utf8");
+    writeFileSync(join(outsideDir, "cancel.flag"), "", "utf8");
+    symlinkSync(outsideDir, join(taskDir, ".ralph-runner"), "dir");
+
+    assert.equal(readStatusFile(taskDir), undefined);
+    assert.deepEqual(readIterationRecords(taskDir), []);
+    assert.deepEqual(readRunnerEvents(taskDir), []);
+    assert.equal(checkStopSignal(taskDir), false);
+    assert.equal(checkCancelSignal(taskDir), false);
+    assert.deepEqual(listActiveLoopRegistryEntries(taskDir), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runner writers reject a symlinked .ralph-runner root", () => {
+  const root = createTempDir();
+  try {
+    const taskDir = join(root, "task");
+    const outsideDir = join(root, "outside");
+    mkdirSync(taskDir);
+    mkdirSync(outsideDir);
+    symlinkSync(outsideDir, join(taskDir, ".ralph-runner"), "dir");
+
+    assert.throws(() => writeStatusFile(taskDir, makeStatusFile({ taskDir })), /Unsafe \.ralph-runner directory/);
+    assert.throws(() => appendIterationRecord(taskDir, makeIterationRecord({ loopToken: "token-a" })), /Unsafe \.ralph-runner directory/);
+    assert.throws(() => appendRunnerEvent(taskDir, { type: "runner.started", timestamp: new Date().toISOString(), loopToken: "token-a", cwd: root, taskDir, status: "initializing", maxIterations: 1, timeout: 300, guardrails: { blockCommands: [], protectedFiles: [] } }), /Unsafe \.ralph-runner directory/);
+    assert.throws(() => createStopSignal(taskDir), /Unsafe \.ralph-runner directory/);
+    assert.throws(() => createCancelSignal(taskDir), /Unsafe \.ralph-runner directory/);
+    assert.throws(
+      () =>
+        writeIterationTranscript(taskDir, {
+          record: makeIterationRecord({ loopToken: "token-a" }),
+          prompt: "prompt",
+          commandOutputs: [],
+        }),
+      /Unsafe \.ralph-runner directory/,
+    );
+
+    assert.equal(existsSync(join(outsideDir, "status.json")), false);
+    assert.equal(existsSync(join(outsideDir, "iterations.jsonl")), false);
+    assert.equal(existsSync(join(outsideDir, "events.jsonl")), false);
+    assert.equal(existsSync(join(outsideDir, "stop.flag")), false);
+    assert.equal(existsSync(join(outsideDir, "cancel.flag")), false);
+    assert.equal(existsSync(join(outsideDir, "transcripts")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // --- writeStatusFile / readStatusFile ---
 
 test("writeStatusFile and readStatusFile round-trip", () => {
@@ -122,6 +182,31 @@ test("readStatusFile returns undefined when no status file exists", () => {
   try {
     const result = readStatusFile(taskDir);
     assert.equal(result, undefined);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("readStatusFile rejects oversized status.json", () => {
+  const taskDir = createTempDir();
+  try {
+    const runnerDir = ensureRunnerDir(taskDir);
+    writeFileSync(join(runnerDir, "status.json"), JSON.stringify({ status: "running", padding: "x".repeat(80_000) }), "utf8");
+    assert.equal(readStatusFile(taskDir), undefined);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("readIterationRecords and readRunnerEvents reject oversized JSONL artifacts", () => {
+  const taskDir = createTempDir();
+  try {
+    const runnerDir = ensureRunnerDir(taskDir);
+    writeFileSync(join(runnerDir, "iterations.jsonl"), `${JSON.stringify(makeIterationRecord())}\n${"x".repeat(1_100_000)}`, "utf8");
+    writeFileSync(join(runnerDir, "events.jsonl"), `${JSON.stringify({ type: "runner.finished", timestamp: new Date().toISOString(), loopToken: "token-a", status: "complete", iterations: 1, totalDurationMs: 1 })}\n${"x".repeat(1_100_000)}`, "utf8");
+
+    assert.deepEqual(readIterationRecords(taskDir), []);
+    assert.deepEqual(readRunnerEvents(taskDir), []);
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

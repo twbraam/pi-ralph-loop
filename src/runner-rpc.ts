@@ -182,8 +182,21 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   const args = spawnArgs ?? ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extensionPath];
   const subprocessEnv = { ...process.env, ...env };
   const telemetry: RpcTelemetry = {
-    spawnedAt: new Date().toISOString(),
+    spawnedAt: "",
   };
+
+  if (signal?.aborted) {
+    telemetry.error = "cancelled";
+    return {
+      success: false,
+      lastAssistantText: "",
+      agentEndMessages: [],
+      timedOut: false,
+      cancelled: true,
+      error: "cancelled",
+      telemetry,
+    };
+  }
 
   let childProcess: ReturnType<typeof spawn>;
   let stderrText = "";
@@ -215,6 +228,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
   });
 
   try {
+    telemetry.spawnedAt = new Date().toISOString();
     childProcess = spawn(spawnCommand, args, {
       cwd,
       env: subprocessEnv,
@@ -272,24 +286,21 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       }));
     };
 
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
     signal?.addEventListener("abort", onAbort, { once: true });
 
-    timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      telemetry.timedOutAt = nowIso();
-      killRpcSubprocessTree(childProcess, "SIGKILL");
-      resolve(buildResult({
-        success: false,
-        lastAssistantText,
-        agentEndMessages,
-        timedOut: true,
-      }));
-    }, timeoutMs);
+    const startIterationTimeout = () => {
+      if (timeout) return;
+      timeout = setTimeout(() => {
+        if (settled) return;
+        telemetry.timedOutAt = nowIso();
+        settle(buildResult({
+          success: false,
+          lastAssistantText,
+          agentEndMessages,
+          timedOut: true,
+        }));
+      }, timeoutMs);
+    };
 
     const endStdin = () => {
       // Close stdin so the subprocess knows no more commands are coming
@@ -386,6 +397,18 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
             }));
             return;
           }
+          if (resp.command === "prompt" && resp.success === false) {
+            const error = `prompt failed${resp.error ? `: ${String(resp.error)}` : ""}`;
+            telemetry.error = error;
+            settle(buildResult({
+              success: false,
+              lastAssistantText,
+              agentEndMessages,
+              timedOut: false,
+              error,
+            }));
+            return;
+          }
           if (resp.command === "set_model" && resp.success === true) {
             modelSetAcknowledged = true;
           }
@@ -447,18 +470,25 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
       telemetry.exitCode = code;
       telemetry.exitSignal = signal;
 
+      const promptAckError = promptSent
+        ? promptAcknowledged
+          ? undefined
+          : "Subprocess exited without acknowledging prompt"
+        : "Subprocess exited before prompt could be sent";
       const closeError =
         code !== 0 && code !== null
           ? `Subprocess exited with code ${code}${stderrText ? `: ${stderrText.slice(0, 200)}` : ""}`
           : signal
             ? `Subprocess exited due to signal ${signal}${stderrText ? `: ${stderrText.slice(0, 200)}` : ""}`
-            : sawAgentEnd
-              ? undefined
-              : "Subprocess exited without sending agent_end";
+            : promptAckError
+              ? promptAckError
+              : sawAgentEnd
+                ? undefined
+                : "Subprocess exited without sending agent_end";
       if (closeError) telemetry.error = closeError;
 
       settle(buildResult({
-        success: sawAgentEnd && code === 0 && signal === null,
+        success: sawAgentEnd && promptAcknowledged && code === 0 && signal === null,
         lastAssistantText,
         agentEndMessages,
         timedOut: false,
@@ -477,6 +507,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
         telemetry.promptSentAt = telemetry.promptSentAt ?? nowIso();
         childProcess.stdin?.write(promptCommand + "\n");
         promptSent = true;
+        startIterationTimeout();
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
         telemetry.error = error;
@@ -505,11 +536,7 @@ export async function runRpcIteration(config: RpcSubprocessConfig): Promise<RpcS
           ? `RPC handshake timed out waiting for ${missing[0]} ack`
           : `RPC handshake timed out waiting for ${missing.join(" and ")} acknowledgements`;
       telemetry.error = error;
-      settled = true;
-      killRpcSubprocessTree(childProcess, "SIGKILL");
-      clearTimeout(timeout);
-      clearTimeout(handshakeTimeout);
-      resolve(buildResult({
+      settle(buildResult({
         success: false,
         lastAssistantText,
         agentEndMessages,

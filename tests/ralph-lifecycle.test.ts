@@ -171,6 +171,18 @@ test("/ralph-status reads durable status and last iteration details", async (t) 
     changedFiles: ["src/example.ts"],
     noProgressStreak: 0,
     completionGate: { ready: false, reasons: ["OPEN_QUESTIONS.md still has P0 items"] },
+    loopToken: "token-beta",
+  });
+  appendIterationRecord(taskDir, {
+    iteration: 99,
+    status: "complete",
+    startedAt: "2026-04-23T13:00:00.000Z",
+    completedAt: "2026-04-23T13:01:00.000Z",
+    durationMs: 60000,
+    progress: true,
+    changedFiles: ["stale.ts"],
+    noProgressStreak: 0,
+    loopToken: "stale-token",
   });
 
   const harness = createHarness();
