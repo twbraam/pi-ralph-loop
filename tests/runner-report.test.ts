@@ -171,6 +171,7 @@ test("generateStaticRunnerReport bounds large inline JSONL previews", (t) => {
   assert.equal(result.iterations, 1200);
   assert.match(html, /preview truncated/);
   assert.match(html, /omitted from parsed report cards after 200 records/);
+  assert.match(html, /large-1199/);
   assert.match(html, /canonical exported file remains complete/);
   assert.ok(Buffer.byteLength(html, "utf8") < 900_000);
 });

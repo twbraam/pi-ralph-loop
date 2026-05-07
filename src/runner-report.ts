@@ -75,7 +75,7 @@ function assertNoSymlinkedExistingPathSegments(targetPath: string, label: string
   }
 }
 
-function readArtifact(path: string, maxBytes = REPORT_ARTIFACT_PREVIEW_MAX_BYTES): ArtifactText {
+function readArtifact(path: string, maxBytes = REPORT_ARTIFACT_PREVIEW_MAX_BYTES, mode: "head" | "tail" = "head"): ArtifactText {
   if (!existsSync(path)) return { text: "", truncated: false, originalBytes: 0 };
   let fd: number | undefined;
   try {
@@ -84,10 +84,16 @@ function readArtifact(path: string, maxBytes = REPORT_ARTIFACT_PREVIEW_MAX_BYTES
     const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
     fd = openSync(path, fsConstants.O_RDONLY | noFollow);
     const bytesToRead = Math.min(stat.size, maxBytes);
+    const offset = mode === "tail" ? Math.max(0, stat.size - bytesToRead) : 0;
     const buffer = Buffer.alloc(bytesToRead);
-    const bytesRead = bytesToRead > 0 ? readSync(fd, buffer, 0, bytesToRead, 0) : 0;
+    const bytesRead = bytesToRead > 0 ? readSync(fd, buffer, 0, bytesToRead, offset) : 0;
+    let text = buffer.toString("utf8", 0, bytesRead);
+    if (mode === "tail" && offset > 0) {
+      const firstNewline = text.indexOf("\n");
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+    }
     return {
-      text: buffer.toString("utf8", 0, bytesRead),
+      text,
       truncated: stat.size > maxBytes,
       originalBytes: stat.size,
     };
@@ -145,16 +151,12 @@ function parseObject(value: string): JsonRecord | null {
   }
 }
 
-function parseJsonl(lines: string[]): ParsedJsonl {
+function parseJsonl(lines: string[], totalLines = lines.length): ParsedJsonl {
   const records: JsonRecord[] = [];
   let invalidLines = 0;
-  let omittedLines = 0;
+  const candidateLines = lines.slice(-REPORT_JSONL_MAX_RECORDS);
 
-  for (const line of lines) {
-    if (records.length >= REPORT_JSONL_MAX_RECORDS) {
-      omittedLines += 1;
-      continue;
-    }
+  for (const line of candidateLines) {
     const parsed = parseObject(line);
     if (parsed) {
       records.push(parsed);
@@ -163,7 +165,7 @@ function parseJsonl(lines: string[]): ParsedJsonl {
     }
   }
 
-  return { records, invalidLines, omittedLines };
+  return { records, invalidLines, omittedLines: Math.max(0, totalLines - records.length - invalidLines) };
 }
 
 function stringValue(value: unknown, fallback = "—"): string {
@@ -634,8 +636,8 @@ function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iteration
   const iterationsJsonl = iterationsArtifact.text;
   const eventsJsonl = eventsArtifact.text;
   const status = parseObject(statusText) ?? {};
-  const parsedIterations = parseJsonl(iterationLines);
-  const parsedEvents = parseJsonl(eventLines);
+  const parsedIterations = parseJsonl(iterationLines, totalIterations);
+  const parsedEvents = parseJsonl(eventLines, totalEvents);
   const iterations = parsedIterations.records;
   const events = parsedEvents.records;
   const currentStatus = status.status ?? latest(iterations)?.status ?? "unknown";
@@ -742,10 +744,12 @@ export function generateStaticRunnerReport(artifactsDir: string, reportName = "r
   const status = readArtifact(join(artifactsDir, "status.json"));
   const iterationsJsonl = readArtifact(join(artifactsDir, "iterations.jsonl"));
   const eventsJsonl = readArtifact(join(artifactsDir, "events.jsonl"));
+  const iterationsTail = readArtifact(join(artifactsDir, "iterations.jsonl"), REPORT_ARTIFACT_PREVIEW_MAX_BYTES, "tail");
+  const eventsTail = readArtifact(join(artifactsDir, "events.jsonl"), REPORT_ARTIFACT_PREVIEW_MAX_BYTES, "tail");
   const iterationsPath = join(artifactsDir, "iterations.jsonl");
   const eventsPath = join(artifactsDir, "events.jsonl");
-  const iterationLines = nonEmptyLines(iterationsJsonl.text);
-  const eventLines = nonEmptyLines(eventsJsonl.text);
+  const iterationLines = nonEmptyLines(iterationsTail.text);
+  const eventLines = nonEmptyLines(eventsTail.text);
   const totalIterations = countNonEmptyLines(iterationsPath);
   const totalEvents = countNonEmptyLines(eventsPath);
   const reportPath = join(artifactsDir, reportName);
