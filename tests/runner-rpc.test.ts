@@ -335,6 +335,120 @@ cat >/dev/null
   }
 });
 
+test("runRpcIteration fails immediately when prompt command is rejected", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-prompt-rejected.sh", `#!/bin/bash
+set -euo pipefail
+read -r prompt_line
+echo '{"type":"response","command":"prompt","success":false,"error":"offline"}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"bad"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /prompt failed: offline/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration fails when agent_end arrives without prompt acknowledgement", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-missing-prompt-ack.sh", `#!/bin/bash
+set -euo pipefail
+read -r prompt_line
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"bad"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /without acknowledging prompt/);
+    assert.equal(result.lastAssistantText, "bad");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration reports an error when agent_end arrives before prompt send", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-agent-end-before-prompt.sh", `#!/bin/bash
+set -euo pipefail
+read -r model_line
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"early"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 5_000,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-20250514",
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /before prompt could be sent/);
+    assert.equal(result.lastAssistantText, "early");
+    assert.equal(result.telemetry.promptSentAt, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runRpcIteration lets handshake timeout classify slow startup before iteration timeout", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
+  try {
+    const mockScript = await writeMockScript(cwd, "mock-pi-slow-before-handshake.sh", `#!/bin/bash
+set -euo pipefail
+read -r model_line
+sleep 0.2
+echo '{"type":"response","command":"set_model","success":true}'
+read -r prompt_line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`);
+
+    const result = await runRpcIteration({
+      prompt: "test prompt",
+      cwd,
+      timeoutMs: 50,
+      handshakeTimeoutMs: 100,
+      spawnCommand: "bash",
+      spawnArgs: [mockScript],
+      provider: "anthropic",
+      modelId: "claude-sonnet-4-20250514",
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /RPC handshake timed out waiting for set_model ack/);
+    assert.equal(result.telemetry.promptSentAt, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runRpcIteration fails when handshake acknowledgements do not arrive before the timeout", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-ralph-rpc-"));
   try {
@@ -736,6 +850,7 @@ test("runRpcIteration returns immediately if AbortSignal is already aborted", as
 
     assert.equal(result.cancelled, true);
     assert.equal(result.success, false);
+    assert.equal(result.telemetry.spawnedAt, "");
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
   }

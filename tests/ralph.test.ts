@@ -1025,6 +1025,12 @@ test("parseCommandArgs handles explicit path args, leaves task text alone, and r
 });
 
 test("parseCommandArgs parses quoted explicit-path args and preserves literal equals", () => {
+  assert.deepEqual(parseCommandArgs('--path "task with spaces" --arg owner=Ada'), {
+    mode: "path",
+    value: "task with spaces",
+    runtimeArgs: [{ name: "owner", value: "Ada" }],
+    error: undefined,
+  });
   assert.deepEqual(parseCommandArgs('--path my-task --arg owner="Ada Lovelace"'), {
     mode: "path",
     value: "my-task",

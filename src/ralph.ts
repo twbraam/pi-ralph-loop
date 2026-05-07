@@ -1049,6 +1049,32 @@ function parseExplicitPathRuntimeArgs(rawTail: string): { runtimeArgs: RuntimeAr
 }
 
 function parseExplicitPathCommandArgs(valueWithArgs: string): CommandArgs {
+  const trimmed = valueWithArgs.trim();
+  if (!trimmed) return { mode: "path", value: "", runtimeArgs: [], error: undefined };
+
+  const quote = trimmed[0];
+  if (quote === "'" || quote === '"') {
+    let index = 1;
+    let value = "";
+    while (index < trimmed.length && trimmed[index] !== quote) {
+      value += trimmed[index];
+      index += 1;
+    }
+    if (index >= trimmed.length) {
+      return { mode: "path", value, runtimeArgs: [], error: "Invalid --path syntax: unterminated quoted path" };
+    }
+    index += 1;
+    if (index < trimmed.length && !/\s/.test(trimmed[index])) {
+      return { mode: "path", value, runtimeArgs: [], error: "Invalid --path syntax: quoted path must be followed by whitespace" };
+    }
+    const rest = trimmed.slice(index).trim();
+    if (rest && !/^--arg(?:\s|=|$)/.test(rest)) {
+      return { mode: "path", value, runtimeArgs: [], error: "Invalid --path syntax: unexpected text after quoted path" };
+    }
+    const parsedArgs = parseExplicitPathRuntimeArgs(rest);
+    return { mode: "path", value, runtimeArgs: parsedArgs.runtimeArgs, error: parsedArgs.error ?? undefined };
+  }
+
   const argMatch = valueWithArgs.match(/(?:^|\s)--arg(?:\s|=|[^\s=]*=|$)/);
   const argIndex = argMatch?.index ?? valueWithArgs.length;
   const value = argMatch ? valueWithArgs.slice(0, argIndex).trim() : valueWithArgs.trim();

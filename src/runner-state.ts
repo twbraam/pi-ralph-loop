@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 // --- Types ---
 
@@ -268,6 +268,10 @@ const ACTIVE_LOOP_REGISTRY_LEGACY_FILE = "active-loops.json";
 const ACTIVE_LOOP_REGISTRY_FILE_EXTENSION = ".json";
 const ACTIVE_LOOP_REGISTRY_STALE_AFTER_MS = 30 * 60 * 1000;
 const ACTIVE_LOOP_ACTIVE_STATUSES = new Set<RunnerStatus>(["initializing", "running"]);
+const STATUS_FILE_MAX_BYTES = 64 * 1024;
+const JSONL_ARTIFACT_MAX_BYTES = 1024 * 1024;
+const JSONL_ARTIFACT_MAX_RECORDS = 1000;
+const ACTIVE_LOOP_REGISTRY_MAX_BYTES = 64 * 1024;
 
 // --- Helper ---
 
@@ -281,41 +285,167 @@ function transcriptDir(taskDir: string): string {
 
 // --- Public API ---
 
+function assertRegularDirectory(dir: string, label: string): void {
+  const stat = lstatSync(dir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Unsafe ${label}: ${dir}`);
+  }
+}
+
+function assertSafeFileForWrite(filePath: string, label: string): void {
+  if (!existsSync(filePath)) return;
+  const stat = lstatSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Unsafe ${label}: ${filePath}`);
+  }
+}
+
+function tempSiblingPath(filePath: string): string {
+  const suffix = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
+  return join(dirname(filePath), `.${basename(filePath)}.${suffix}.tmp`);
+}
+
+function writeFileReplacing(filePath: string, contents: string, label: string): void {
+  assertSafeFileForWrite(filePath, label);
+  const tempPath = tempSiblingPath(filePath);
+  try {
+    writeFileSync(tempPath, contents, { encoding: "utf8", flag: "wx" });
+    renameSync(tempPath, filePath);
+  } catch (err) {
+    rmSync(tempPath, { force: true });
+    throw err;
+  }
+}
+
+function appendFileNoFollow(filePath: string, contents: string, label: string): void {
+  assertSafeFileForWrite(filePath, label);
+  const noFollow = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+  const fd = openSync(filePath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | noFollow, 0o600);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new Error(`Unsafe ${label}: ${filePath}`);
+    }
+    writeSync(fd, contents, undefined, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readRegularFileNoFollowBounded(filePath: string, maxBytes: number): string | undefined {
+  if (!existsSync(filePath)) return undefined;
+  let fd: number | undefined;
+  try {
+    const preOpenStat = lstatSync(filePath);
+    if (preOpenStat.isSymbolicLink() || !preOpenStat.isFile() || preOpenStat.size > maxBytes) return undefined;
+    const noFollow = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+    fd = openSync(filePath, fsConstants.O_RDONLY | noFollow);
+    const postOpenStat = fstatSync(fd);
+    if (!postOpenStat.isFile() || postOpenStat.size > maxBytes) return undefined;
+    const bytesToRead = Math.min(postOpenStat.size, maxBytes);
+    const buffer = Buffer.alloc(bytesToRead);
+    const bytesRead = bytesToRead > 0 ? readSync(fd, buffer, 0, bytesToRead, 0) : 0;
+    return buffer.toString("utf8", 0, bytesRead);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function isSafeExistingRunnerDir(taskDir: string): boolean {
+  const dir = runnerDir(taskDir);
+  if (!existsSync(dir)) return false;
+  try {
+    const stat = lstatSync(dir);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function parseJsonLinesBounded<T>(raw: string | undefined, predicate?: (value: unknown) => value is T): T[] {
+  if (raw === undefined) return [];
+  const records: T[] = [];
+  for (const line of raw.split("\n")) {
+    if (records.length >= JSONL_ARTIFACT_MAX_RECORDS) break;
+    if (!line.trim()) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (!predicate || predicate(parsed)) records.push(parsed as T);
+    } catch {
+      // skip malformed JSONL lines
+    }
+  }
+  return records;
+}
+
 export function ensureRunnerDir(taskDir: string): string {
   const dir = runnerDir(taskDir);
-  if (!existsSync(dir)) {
+  if (existsSync(dir)) {
+    assertRegularDirectory(dir, ".ralph-runner directory");
+  } else {
     mkdirSync(dir, { recursive: true });
+    assertRegularDirectory(dir, ".ralph-runner directory");
+  }
+  return dir;
+}
+
+function ensureTranscriptDir(taskDir: string): string {
+  const dir = transcriptDir(taskDir);
+  ensureRunnerDir(taskDir);
+  if (existsSync(dir)) {
+    assertRegularDirectory(dir, "transcripts directory");
+  } else {
+    mkdirSync(dir, { recursive: true });
+    assertRegularDirectory(dir, "transcripts directory");
   }
   return dir;
 }
 
 export function writeStatusFile(taskDir: string, status: RunnerStatusFile): void {
   const dir = ensureRunnerDir(taskDir);
-  writeFileSync(join(dir, STATUS_FILE), JSON.stringify(status, null, 2), "utf8");
+  writeFileReplacing(join(dir, STATUS_FILE), `${JSON.stringify(status, null, 2)}\n`, "status file");
 }
 
 export function readStatusFile(taskDir: string): RunnerStatusFile | undefined {
+  if (!isSafeExistingRunnerDir(taskDir)) return undefined;
   const filePath = join(runnerDir(taskDir), STATUS_FILE);
-  if (!existsSync(filePath)) return undefined;
+  const raw = readRegularFileNoFollowBounded(filePath, STATUS_FILE_MAX_BYTES);
+  if (raw === undefined) return undefined;
   try {
-    const raw = readFileSync(filePath, "utf8");
     return JSON.parse(raw) as RunnerStatusFile;
   } catch {
     return undefined;
   }
 }
 
+const RPC_TELEMETRY_STDERR_MAX_CHARS = 4000;
+
+function boundedIterationRecord(record: IterationRecord): IterationRecord {
+  const telemetry = record.rpcTelemetry;
+  const stderrText = telemetry?.stderrText;
+  if (!telemetry || typeof stderrText !== "string" || stderrText.length <= RPC_TELEMETRY_STDERR_MAX_CHARS) return record;
+  return {
+    ...record,
+    rpcTelemetry: {
+      ...telemetry,
+      stderrText: `${stderrText.slice(0, RPC_TELEMETRY_STDERR_MAX_CHARS)}\n[ralph: rpc stderr truncated in iteration metadata]`,
+    },
+  };
+}
+
 export function appendIterationRecord(taskDir: string, record: IterationRecord): void {
   const dir = ensureRunnerDir(taskDir);
   const filePath = join(dir, ITERATIONS_FILE);
-  const line = JSON.stringify(record) + "\n";
-  writeFileSync(filePath, line, { flag: "a", encoding: "utf8" });
+  const line = JSON.stringify(boundedIterationRecord(record)) + "\n";
+  appendFileNoFollow(filePath, line, "iteration record file");
 }
 
 export function appendRunnerEvent(taskDir: string, event: RunnerEvent): void {
   const dir = ensureRunnerDir(taskDir);
   const filePath = join(dir, EVENTS_FILE);
-  writeFileSync(filePath, `${JSON.stringify(event)}\n`, { flag: "a", encoding: "utf8" });
+  appendFileNoFollow(filePath, `${JSON.stringify(event)}\n`, "runner event file");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -538,24 +668,10 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
 }
 
 export function readRunnerEvents(taskDir: string): RunnerEvent[] {
+  if (!isSafeExistingRunnerDir(taskDir)) return [];
   const filePath = join(runnerDir(taskDir), EVENTS_FILE);
-  if (!existsSync(filePath)) return [];
-  try {
-    const raw = readFileSync(filePath, "utf8");
-    return raw
-      .split("\n")
-      .filter((line) => line.trim())
-      .flatMap((line) => {
-        try {
-          const parsed: unknown = JSON.parse(line);
-          return isRunnerEvent(parsed) ? [parsed] : [];
-        } catch {
-          return [];
-        }
-      });
-  } catch {
-    return [];
-  }
+  const raw = readRegularFileNoFollowBounded(filePath, JSONL_ARTIFACT_MAX_BYTES);
+  return parseJsonLinesBounded(raw, isRunnerEvent);
 }
 
 function normalizeTranscriptText(value: string): string {
@@ -639,10 +755,15 @@ function transcriptHeaderLines(record: IterationRecord): string[] {
 }
 
 export function writeIterationTranscript(taskDir: string, transcript: IterationTranscriptInput): string {
-  const dir = transcriptDir(taskDir);
-  mkdirSync(dir, { recursive: true });
+  const dir = ensureTranscriptDir(taskDir);
   const runToken = transcript.record.loopToken ?? "unknown";
   const filePath = join(dir, `iteration-${String(transcript.record.iteration).padStart(3, "0")}-${runToken}.md`);
+  if (existsSync(filePath)) {
+    const stat = lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`Unsafe transcript path: ${filePath}`);
+    }
+  }
   const lines: string[] = [`# Iteration ${transcript.record.iteration}`, "", ...transcriptHeaderLines(transcript.record), "", "## Rendered prompt", "", "```text", normalizeTranscriptText(transcript.prompt), "```", "", "## Command outputs", ""];
 
   if (transcript.commandOutputs.length === 0) {
@@ -660,37 +781,24 @@ export function writeIterationTranscript(taskDir: string, transcript: IterationT
     lines.push("", "## Outcome", "", transcript.note);
   }
 
-  writeFileSync(filePath, lines.join("\n") + "\n", "utf8");
+  writeFileSync(filePath, lines.join("\n") + "\n", { encoding: "utf8", flag: "wx" });
   return filePath;
 }
 
 export function readIterationRecords(taskDir: string): IterationRecord[] {
+  if (!isSafeExistingRunnerDir(taskDir)) return [];
   const filePath = join(runnerDir(taskDir), ITERATIONS_FILE);
-  if (!existsSync(filePath)) return [];
-  try {
-    const raw = readFileSync(filePath, "utf8");
-    return raw
-      .split("\n")
-      .filter((line) => line.trim())
-      .flatMap((line) => {
-        try {
-          return [JSON.parse(line) as IterationRecord];
-        } catch {
-          return [];
-        }
-      });
-  } catch {
-    return [];
-  }
+  const raw = readRegularFileNoFollowBounded(filePath, JSONL_ARTIFACT_MAX_BYTES);
+  return parseJsonLinesBounded<IterationRecord>(raw);
 }
 
 export function createStopSignal(taskDir: string): void {
   const dir = ensureRunnerDir(taskDir);
-  writeFileSync(join(dir, STOP_FLAG_FILE), "", "utf8");
+  writeFileReplacing(join(dir, STOP_FLAG_FILE), "", "stop flag");
 }
 
 export function checkStopSignal(taskDir: string): boolean {
-  return existsSync(join(runnerDir(taskDir), STOP_FLAG_FILE));
+  return isSafeExistingRunnerDir(taskDir) && existsSync(join(runnerDir(taskDir), STOP_FLAG_FILE));
 }
 
 export function clearStopSignal(taskDir: string): void {
@@ -702,11 +810,11 @@ export function clearStopSignal(taskDir: string): void {
 
 export function createCancelSignal(taskDir: string): void {
   const dir = ensureRunnerDir(taskDir);
-  writeFileSync(join(dir, CANCEL_FLAG_FILE), "", "utf8");
+  writeFileReplacing(join(dir, CANCEL_FLAG_FILE), "", "cancel flag");
 }
 
 export function checkCancelSignal(taskDir: string): boolean {
-  return existsSync(join(runnerDir(taskDir), CANCEL_FLAG_FILE));
+  return isSafeExistingRunnerDir(taskDir) && existsSync(join(runnerDir(taskDir), CANCEL_FLAG_FILE));
 }
 
 export function clearCancelSignal(taskDir: string): void {
@@ -732,17 +840,19 @@ function activeLoopRegistryEntryPath(cwd: string, taskDir: string): string {
 }
 
 function ensureActiveLoopRegistryDir(cwd: string): string {
-  const dir = activeLoopRegistryDir(cwd);
-  if (!existsSync(dir)) {
+  const runner = ensureRunnerDir(cwd);
+  const dir = join(runner, ACTIVE_LOOP_REGISTRY_DIR);
+  if (existsSync(dir)) {
+    assertRegularDirectory(dir, "active loop registry directory");
+  } else {
     mkdirSync(dir, { recursive: true });
+    assertRegularDirectory(dir, "active loop registry directory");
   }
   return dir;
 }
 
 function writeFileAtomic(filePath: string, contents: string): void {
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tempPath, contents, "utf8");
-  renameSync(tempPath, filePath);
+  writeFileReplacing(filePath, contents, "active loop registry file");
 }
 
 function parseIsoTimestamp(raw: unknown): number | undefined {
@@ -822,7 +932,11 @@ function normalizeActiveLoopRegistryEntry(entry: unknown): ActiveLoopRegistryEnt
 function readActiveLoopRegistryEntryFile(filePath: string): ActiveLoopRegistryEntry | undefined {
   if (!existsSync(filePath)) return undefined;
   try {
-    const raw = readFileSync(filePath, "utf8");
+    const raw = readRegularFileNoFollowBounded(filePath, ACTIVE_LOOP_REGISTRY_MAX_BYTES);
+    if (raw === undefined) {
+      rmSync(filePath, { force: true });
+      return undefined;
+    }
     const parsed: unknown = JSON.parse(raw);
     const entry = normalizeActiveLoopRegistryEntry(parsed);
     if (!entry) {
@@ -841,10 +955,19 @@ function readActiveLoopRegistryEntryFile(filePath: string): ActiveLoopRegistryEn
 }
 
 function readLegacyActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[] {
-  const filePath = join(runnerDir(cwd), ACTIVE_LOOP_REGISTRY_LEGACY_FILE);
+  const baseDir = runnerDir(cwd);
+  if (existsSync(baseDir)) {
+    try {
+      assertRegularDirectory(baseDir, ".ralph-runner directory");
+    } catch {
+      return [];
+    }
+  }
+  const filePath = join(baseDir, ACTIVE_LOOP_REGISTRY_LEGACY_FILE);
   if (!existsSync(filePath)) return [];
   try {
-    const raw = readFileSync(filePath, "utf8");
+    const raw = readRegularFileNoFollowBounded(filePath, ACTIVE_LOOP_REGISTRY_MAX_BYTES);
+    if (raw === undefined) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
 
@@ -853,7 +976,7 @@ function readLegacyActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEnt
 
     if (freshEntries.length !== normalizedEntries.length) {
       if (freshEntries.length > 0) {
-        writeFileSync(filePath, `${JSON.stringify(freshEntries, null, 2)}\n`, "utf8");
+        writeFileReplacing(filePath, `${JSON.stringify(freshEntries, null, 2)}\n`, "legacy active loop registry file");
       } else {
         rmSync(filePath, { force: true });
       }
@@ -866,6 +989,7 @@ function readLegacyActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEnt
 }
 
 function readRawActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[] {
+  if (!isSafeExistingRunnerDir(cwd)) return [];
   const dir = activeLoopRegistryDir(cwd);
   const entriesByTaskDir = new Map<string, ActiveLoopRegistryEntry>();
 
@@ -874,10 +998,15 @@ function readRawActiveLoopRegistryEntries(cwd: string): ActiveLoopRegistryEntry[
   }
 
   if (existsSync(dir)) {
-    for (const dirent of readdirSync(dir, { withFileTypes: true })) {
-      if (!dirent.isFile() || !dirent.name.endsWith(ACTIVE_LOOP_REGISTRY_FILE_EXTENSION)) continue;
-      const entry = readActiveLoopRegistryEntryFile(join(dir, dirent.name));
-      if (entry) entriesByTaskDir.set(entry.taskDir, entry);
+    try {
+      assertRegularDirectory(dir, "active loop registry directory");
+      for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+        if (!dirent.isFile() || !dirent.name.endsWith(ACTIVE_LOOP_REGISTRY_FILE_EXTENSION)) continue;
+        const entry = readActiveLoopRegistryEntryFile(join(dir, dirent.name));
+        if (entry) entriesByTaskDir.set(entry.taskDir, entry);
+      }
+    } catch {
+      // Ignore unsafe or concurrently removed registry directories.
     }
   }
 

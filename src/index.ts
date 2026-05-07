@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionEvent, SessionEntry, AgentEndEvent as PiAgentEndEvent, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent as PiToolResultEvent } from "@mariozechner/pi-coding-agent";
 
@@ -1159,6 +1159,25 @@ function findActiveLifecycleRegistryEntry(ctx: Pick<CommandContext, "cwd">, task
   return undefined;
 }
 
+const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+function getSelectedThinkingLevel(ctx: CommandContext, fallback?: string): string | undefined {
+  const contextCandidates = ctx as unknown as {
+    thinkingLevel?: unknown;
+    currentThinkingLevel?: unknown;
+    modelThinkingLevel?: unknown;
+  };
+  for (const candidate of [contextCandidates.thinkingLevel, contextCandidates.currentThinkingLevel, contextCandidates.modelThinkingLevel]) {
+    if (typeof candidate === "string" && VALID_THINKING_LEVELS.has(candidate)) return candidate;
+  }
+
+  if (fallback && VALID_THINKING_LEVELS.has(fallback)) return fallback;
+  const reasoning = (ctx.model as unknown as { reasoning?: unknown } | undefined)?.reasoning;
+  if (typeof reasoning === "string" && VALID_THINKING_LEVELS.has(reasoning)) return reasoning;
+  if (reasoning === true) return "high";
+  return undefined;
+}
+
 function summarizeIterationRecord(record: IterationRecord): string {
   const parts = [`lastIteration: #${record.iteration}`];
   if (typeof record.durationMs === "number") {
@@ -1222,59 +1241,311 @@ function archiveRunnerArtifacts(taskDir: string, archiveName = new Date().toISOS
   return archiveDir;
 }
 
-function exportRalphLogs(taskDir: string, destDir: string): { iterations: number; events: number; transcripts: number } {
-  const runnerDir = join(taskDir, ".ralph-runner");
-  if (!existsSync(runnerDir)) {
-    throw new Error(`No .ralph-runner directory found at ${taskDir}`);
+function assertSafeExistingDirectory(path: string, label: string): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Unsafe ${label}: ${path}`);
   }
+}
 
-  mkdirSync(destDir, { recursive: true });
+function isAllowedDarwinSystemRootAlias(path: string): boolean {
+  return process.platform === "darwin" && (path === "/var" || path === "/tmp" || path === "/etc");
+}
 
-  const filesToCopy = ["status.json", "iterations.jsonl", "events.jsonl"];
-  for (const file of filesToCopy) {
-    const src = join(runnerDir, file);
-    if (existsSync(src)) {
-      copyFileSync(src, join(destDir, file));
+function assertNoSymlinkedExistingPathSegments(targetPath: string, label: string): void {
+  const resolvedTarget = resolve(targetPath);
+  const parsed = parsePath(resolvedTarget);
+  let current = parsed.root;
+  const segments = resolvedTarget.slice(parsed.root.length).split(/[\\/]+/).filter(Boolean);
+
+  for (const segment of segments) {
+    current = join(current, segment);
+    if (!existsSync(current)) continue;
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch {
+      throw new Error(`Unsafe ${label}: ${current}`);
+    }
+    if (stat.isSymbolicLink() && !isAllowedDarwinSystemRootAlias(current)) {
+      throw new Error(`Unsafe ${label}: ${current}`);
     }
   }
+}
 
-  // Copy transcripts directory
-  const transcriptsDir = join(runnerDir, "transcripts");
-  let transcripts = 0;
-  if (existsSync(transcriptsDir)) {
-    const destTranscripts = join(destDir, "transcripts");
-    mkdirSync(destTranscripts, { recursive: true });
-    for (const entry of readdirSync(transcriptsDir)) {
-      const srcPath = join(transcriptsDir, entry);
-      try {
-        const stat = lstatSync(srcPath);
-        if (stat.isFile() && !stat.isSymbolicLink()) {
-          copyFileSync(srcPath, join(destTranscripts, entry));
-          transcripts++;
+function ensureDirectoryPathWithoutSymlinks(targetPath: string, label: string): void {
+  const resolvedTarget = resolve(targetPath);
+  const parsed = parsePath(resolvedTarget);
+  let current = parsed.root;
+  const segments = resolvedTarget.slice(parsed.root.length).split(/[\\/]+/).filter(Boolean);
+
+  for (const segment of segments) {
+    current = join(current, segment);
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemRootAlias(current)) {
+          throw new Error(`Unsafe ${label}: ${current}`);
         }
-      } catch {
-        // skip unreadable entries
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`Unsafe ${label}: ${current}`);
+      }
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) {
+        throw error;
+      }
+      mkdirSync(current);
+      const createdStat = lstatSync(current);
+      if (createdStat.isSymbolicLink() || !createdStat.isDirectory()) {
+        throw new Error(`Unsafe ${label}: ${current}`);
       }
     }
   }
+}
 
-  // Count iterations and events
-  let iterations = 0;
-  let events = 0;
-  const iterPath = join(destDir, "iterations.jsonl");
-  if (existsSync(iterPath)) {
-    iterations = readFileSync(iterPath, "utf8").split("\n").filter((l) => l.trim()).length;
-  }
-  const evPath = join(destDir, "events.jsonl");
-  if (existsSync(evPath)) {
-    events = readFileSync(evPath, "utf8").split("\n").filter((l) => l.trim()).length;
+type PreparedExportDirectory = {
+  finalDestDir: string;
+  stagingDir: string;
+};
+
+function prepareExportDirectory(destDir: string): PreparedExportDirectory {
+  const finalDestDir = resolve(destDir);
+  const parentDir = dirname(finalDestDir);
+  ensureDirectoryPathWithoutSymlinks(parentDir, "export destination parent path segment");
+  assertSafeExistingDirectory(parentDir, "export destination parent");
+
+  if (existsSync(finalDestDir)) {
+    assertSafeExistingDirectory(finalDestDir, "export destination");
+    if (readdirSync(finalDestDir).length > 0) {
+      throw new Error(`Export destination must be empty: ${finalDestDir}`);
+    }
+  } else {
+    assertNoSymlinkedExistingPathSegments(finalDestDir, "export destination path segment");
   }
 
-  return { iterations, events, transcripts };
+  const stagingDir = join(parentDir, `.ralph-logs-${basename(finalDestDir)}-${process.pid}-${randomUUID()}.tmp`);
+  mkdirSync(stagingDir, { mode: 0o700 });
+  assertNoSymlinkedExistingPathSegments(stagingDir, "export staging destination path segment");
+  assertSafeExistingDirectory(stagingDir, "export staging destination");
+  return { finalDestDir, stagingDir };
+}
+
+function finalizeExportDirectory(prepared: PreparedExportDirectory): string {
+  assertNoSymlinkedExistingPathSegments(prepared.finalDestDir, "export destination path segment");
+  if (existsSync(prepared.finalDestDir)) {
+    assertSafeExistingDirectory(prepared.finalDestDir, "export destination");
+    if (readdirSync(prepared.finalDestDir).length > 0) {
+      throw new Error(`Export destination must be empty: ${prepared.finalDestDir}`);
+    }
+    rmdirSync(prepared.finalDestDir);
+  }
+  renameSync(prepared.stagingDir, prepared.finalDestDir);
+  assertNoSymlinkedExistingPathSegments(prepared.finalDestDir, "export destination path segment");
+  assertSafeExistingDirectory(prepared.finalDestDir, "export destination");
+  return prepared.finalDestDir;
+}
+
+function prepareExportSubdirectory(parentDir: string, name: string): string {
+  const dest = join(parentDir, name);
+  if (existsSync(dest)) {
+    assertSafeExistingDirectory(dest, `export ${name} destination`);
+    if (readdirSync(dest).length > 0) {
+      throw new Error(`Export ${name} destination must be empty: ${dest}`);
+    }
+  } else {
+    mkdirSync(dest);
+  }
+  assertNoSymlinkedExistingPathSegments(dest, `export ${name} destination path segment`);
+  assertSafeExistingDirectory(dest, `export ${name} destination`);
+  return dest;
+}
+
+function assertOpenedSourceIsUnderRoot(src: string, srcFd: number, sourceRootRealPath: string) {
+  const openedStat = fstatSync(srcFd);
+  if (!openedStat.isFile()) {
+    throw new Error(`Unsafe export source: ${src}`);
+  }
+  const currentStat = lstatSync(src);
+  if (currentStat.isSymbolicLink() || !currentStat.isFile() || currentStat.dev !== openedStat.dev || currentStat.ino !== openedStat.ino) {
+    throw new Error(`Unsafe export source: ${src}`);
+  }
+  const realSource = realpathSync(src);
+  if (!isWithinPath(sourceRootRealPath, realSource)) {
+    throw new Error(`Unsafe export source: ${src}`);
+  }
+  return openedStat;
+}
+
+function assertDestinationParentUnderRoot(dest: string, destRootRealPath: string): void {
+  const parentDir = dirname(dest);
+  assertSafeExistingDirectory(parentDir, "export destination parent");
+  const realParent = realpathSync(parentDir);
+  if (!isWithinPath(destRootRealPath, realParent)) {
+    throw new Error(`Unsafe export destination: ${dest}`);
+  }
+}
+
+function copyExportFileNoOverwrite(src: string, dest: string, sourceRootRealPath: string, destRootRealPath: string, transform?: (data: Buffer) => Buffer): void {
+  assertNoSymlinkedExistingPathSegments(dest, "export destination path segment");
+  if (existsSync(dest)) {
+    const stat = lstatSync(dest);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`Unsafe export destination: ${dest}`);
+    }
+    throw new Error(`Export destination already exists: ${dest}`);
+  }
+
+  const noFollowFlag = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  let srcFd: number | undefined;
+  let destFd: number | undefined;
+  try {
+    srcFd = openSync(src, fsConstants.O_RDONLY | noFollowFlag);
+    const srcStat = assertOpenedSourceIsUnderRoot(src, srcFd, sourceRootRealPath);
+    const sourceData = readFileSync(srcFd);
+    const data = transform ? transform(sourceData) : sourceData;
+
+    assertDestinationParentUnderRoot(dest, destRootRealPath);
+    destFd = openSync(dest, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, srcStat.mode & 0o666);
+    assertDestinationParentUnderRoot(dest, destRootRealPath);
+    const destStat = fstatSync(destFd);
+    const currentDestStat = lstatSync(dest);
+    if (!destStat.isFile() || currentDestStat.isSymbolicLink() || currentDestStat.dev !== destStat.dev || currentDestStat.ino !== destStat.ino) {
+      throw new Error(`Unsafe export destination: ${dest}`);
+    }
+    if (!isWithinPath(destRootRealPath, realpathSync(dest))) {
+      throw new Error(`Unsafe export destination: ${dest}`);
+    }
+    writeSync(destFd, data, 0, data.length);
+  } finally {
+    if (destFd !== undefined) closeSync(destFd);
+    if (srcFd !== undefined) closeSync(srcFd);
+  }
+}
+
+function parseLoopTokenFromStatusBytes(data: Buffer): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(data.toString("utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const token = (parsed as { loopToken?: unknown }).loopToken;
+      return typeof token === "string" && token.length > 0 ? token : undefined;
+    }
+  } catch {
+    // malformed status is still copied as raw evidence
+  }
+  return undefined;
+}
+
+function filterJsonlBytesByLoopToken(data: Buffer, loopToken: string | undefined): Buffer {
+  if (!loopToken) return data;
+  const lines = data.toString("utf8").split("\n");
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { loopToken?: unknown }).loopToken === loopToken) {
+        kept.push(line);
+      }
+    } catch {
+      // malformed lines are not current-loop evidence
+    }
+  }
+  return Buffer.from(kept.length > 0 ? `${kept.join("\n")}\n` : "", "utf8");
+}
+
+function transcriptMatchesLoopToken(entry: string, loopToken: string | undefined): boolean {
+  return !loopToken || entry.endsWith(`-${loopToken}.md`);
+}
+
+function countNonEmptyLines(filePath: string): number {
+  if (!existsSync(filePath)) return 0;
+  return readFileSync(filePath, "utf8").split("\n").filter((line) => line.trim()).length;
+}
+
+function exportRalphLogs(taskDir: string, destDir: string): { iterations: number; events: number; transcripts: number } {
+  assertNoSymlinkedExistingPathSegments(taskDir, "task path");
+  const runnerDir = join(taskDir, ".ralph-runner");
+  assertNoSymlinkedExistingPathSegments(runnerDir, ".ralph-runner path");
+  if (!existsSync(runnerDir)) {
+    throw new Error(`No .ralph-runner directory found at ${taskDir}`);
+  }
+  const runnerStat = lstatSync(runnerDir);
+  if (runnerStat.isSymbolicLink() || !runnerStat.isDirectory()) {
+    throw new Error(`Unsafe .ralph-runner directory at ${taskDir}`);
+  }
+  const runnerRootRealPath = realpathSync(runnerDir);
+
+  const preparedDest = prepareExportDirectory(destDir);
+  const stagingRootRealPath = realpathSync(preparedDest.stagingDir);
+  let finalized = false;
+
+  try {
+    let loopToken: string | undefined;
+    const statusPath = join(runnerDir, "status.json");
+    if (existsSync(statusPath)) {
+      copyExportFileNoOverwrite(statusPath, join(preparedDest.stagingDir, "status.json"), runnerRootRealPath, stagingRootRealPath, (data) => {
+        loopToken = parseLoopTokenFromStatusBytes(data);
+        return data;
+      });
+    }
+
+    for (const file of ["iterations.jsonl", "events.jsonl"]) {
+      const src = join(runnerDir, file);
+      if (!existsSync(src)) continue;
+      let stat;
+      try {
+        stat = lstatSync(src);
+      } catch {
+        continue;
+      }
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        copyExportFileNoOverwrite(src, join(preparedDest.stagingDir, file), runnerRootRealPath, stagingRootRealPath, (data) => filterJsonlBytesByLoopToken(data, loopToken));
+      }
+    }
+
+    const transcriptsDir = join(runnerDir, "transcripts");
+    let transcripts = 0;
+    if (existsSync(transcriptsDir)) {
+      assertNoSymlinkedExistingPathSegments(transcriptsDir, "transcripts path");
+      const transcriptsStat = lstatSync(transcriptsDir);
+      if (transcriptsStat.isDirectory() && !transcriptsStat.isSymbolicLink()) {
+        const destTranscripts = prepareExportSubdirectory(preparedDest.stagingDir, "transcripts");
+        for (const entry of readdirSync(transcriptsDir)) {
+          if (!transcriptMatchesLoopToken(entry, loopToken)) continue;
+          const srcPath = join(transcriptsDir, entry);
+          let stat;
+          try {
+            stat = lstatSync(srcPath);
+          } catch {
+            continue;
+          }
+          if (stat.isFile() && !stat.isSymbolicLink()) {
+            copyExportFileNoOverwrite(srcPath, join(destTranscripts, entry), runnerRootRealPath, stagingRootRealPath);
+            transcripts++;
+          }
+        }
+      }
+    }
+
+    const iterations = countNonEmptyLines(join(preparedDest.stagingDir, "iterations.jsonl"));
+    const events = countNonEmptyLines(join(preparedDest.stagingDir, "events.jsonl"));
+
+    finalizeExportDirectory(preparedDest);
+    finalized = true;
+    return { iterations, events, transcripts };
+  } finally {
+    if (!finalized) {
+      rmSync(preparedDest.stagingDir, { recursive: true, force: true });
+    }
+  }
 }
 
 export function parseLogExportArgs(raw: string): { path?: string; dest?: string; error?: string } {
-  const parts = raw.trim().split(/\s+/);
+  const tokenized = tokenizeScaffoldArgs(raw);
+  if (tokenized.error) return { error: tokenized.error.replace("/ralph-scaffold", "/ralph-logs") };
+  const parts = tokenized.tokens;
   let path: string | undefined;
   let dest: string | undefined;
   let i = 0;
@@ -1685,6 +1956,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
   registeredPi[RALPH_EXTENSION_REGISTERED] = true;
   const failCounts = new Map<string, number>();
   const pendingIterations = new Map<string, PendingIterationState>();
+  let selectedThinkingLevel: string | undefined;
   const draftPlanFactory = services.createDraftPlan ?? createDraftPlanService;
   const isLoopSession = (ctx: Pick<CommandContext, "sessionManager">): boolean => resolveActiveLoopState(ctx) !== undefined;
   const appendLoopProofEntry = (customType: string, data: Record<string, unknown>): void => {
@@ -1820,7 +2092,7 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
         stopOnError: currentStopOnError,
         runtimeArgs,
         modelPattern: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
-        thinkingLevel: ctx.model?.reasoning ? "high" : undefined,
+        thinkingLevel: getSelectedThinkingLevel(ctx, selectedThinkingLevel),
         runCommandsFn: async (commands, guardrails, commandPi, cwd, taskDir, commandRuntimeArgs) => runCommands(commands, guardrails, commandPi as ExtensionAPI, commandRuntimeArgs ?? runtimeArgs, cwd, taskDir),
         onStatusChange(status) {
           const runtimeUi = resolveSessionUi(currentCommandCtx);
@@ -2001,6 +2273,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
     return handleExistingInspection(parsed.value);
   }
 
+  (pi.on as any)("thinking_level_select", async (event: { level?: unknown }) => {
+    if (typeof event.level === "string" && VALID_THINKING_LEVELS.has(event.level)) selectedThinkingLevel = event.level;
+  });
+
   pi.on("tool_call", async (event: ToolCallEvent, ctx: EventContext) => {
     const persisted = resolveActiveLoopState(ctx);
     if (!persisted) return;
@@ -2173,7 +2449,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       ];
 
       const iterationRecords = readIterationRecords(target.taskDir);
-      const lastIteration = iterationRecords[iterationRecords.length - 1];
+      const matchingIterationRecords = statusFile.loopToken ? iterationRecords.filter((record) => record.loopToken === statusFile.loopToken) : iterationRecords;
+      const lastIteration = matchingIterationRecords[matchingIterationRecords.length - 1];
       if (lastIteration) {
         lines.push(summarizeIterationRecord(lastIteration));
       }

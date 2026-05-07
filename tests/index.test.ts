@@ -409,6 +409,7 @@ test("registerRalphCommands is idempotent for the same extension API instance", 
 
   assert.deepEqual(registeredCommands, ["ralph", "ralph-draft", "ralph-list", "ralph-status", "ralph-resume", "ralph-archive", "ralph-stop", "ralph-cancel", "ralph-scaffold", "ralph-logs"]);
   assert.deepEqual(registeredEvents, [
+    "thinking_level_select",
     "tool_call",
     "tool_execution_start",
     "tool_execution_end",
@@ -1162,6 +1163,115 @@ test("parseLogExportArgs parses --dest correctly", () => {
   assert.deepEqual(parseLogExportArgs("my-task --dest exported"), { path: "my-task", dest: "exported" });
 });
 
+test("parseLogExportArgs parses quoted paths with spaces", () => {
+  assert.deepEqual(parseLogExportArgs('--path "task with spaces" --dest "out logs"'), { path: "task with spaces", dest: "out logs" });
+});
+
+test("/ralph-logs rejects non-empty destinations without overwriting files", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  const destDir = join(cwd, "exported");
+  mkdirSync(destDir);
+  writeFileSync(join(destDir, "status.json"), "important", "utf8");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  assert.equal(readFileSync(join(destDir, "status.json"), "utf8"), "important");
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Export destination must be empty")));
+});
+
+test("/ralph-logs rejects symlinked destinations without writing through them", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  const outsideDir = join(cwd, "outside");
+  mkdirSync(join(taskDir, ".ralph-runner"), { recursive: true });
+  mkdirSync(outsideDir);
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
+  symlinkSync(outsideDir, join(cwd, "exported"), "dir");
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  assert.equal(existsSync(join(outsideDir, "status.json")), false);
+  assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("Unsafe export destination")));
+});
+
+test("/ralph-logs exports only records for the current loop token when status has one", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const taskDir = join(cwd, "my-task");
+  mkdirSync(join(taskDir, ".ralph-runner", "transcripts"), { recursive: true });
+  writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "complete", loopToken: "current-token" }), "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), `${JSON.stringify({ iteration: 1, loopToken: "stale-token" })}\n${JSON.stringify({ iteration: 2, loopToken: "current-token" })}\n`, "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "events.jsonl"), `${JSON.stringify({ type: "iteration.completed", loopToken: "stale-token" })}\n${JSON.stringify({ type: "iteration.completed", loopToken: "current-token" })}\n`, "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "iteration-001-stale-token.md"), "stale", "utf8");
+  writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "iteration-002-current-token.md"), "current", "utf8");
+
+  const harness = createHarness();
+  const handler = harness.handler("ralph-logs");
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: {
+      notify: () => undefined,
+      select: async () => undefined,
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    sessionManager: { getEntries: () => [], getSessionFile: () => "session-a" },
+  };
+
+  await handler("my-task --dest exported", ctx);
+
+  const exportedDir = join(cwd, "exported");
+  assert.equal(readFileSync(join(exportedDir, "iterations.jsonl"), "utf8"), `${JSON.stringify({ iteration: 2, loopToken: "current-token" })}\n`);
+  assert.equal(readFileSync(join(exportedDir, "events.jsonl"), "utf8"), `${JSON.stringify({ type: "iteration.completed", loopToken: "current-token" })}\n`);
+  assert.equal(existsSync(join(exportedDir, "transcripts", "iteration-001-stale-token.md")), false);
+  assert.equal(readFileSync(join(exportedDir, "transcripts", "iteration-002-current-token.md"), "utf8"), "current");
+});
+
 test("/ralph-logs excludes runtime control files", async (t) => {
   const cwd = createTempDir();
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -1483,6 +1593,53 @@ test("/ralph --path existing-task/RALPH.md bypasses the drafting pipeline", asyn
   await handler(`--path ${existingRalphPath}`, ctx);
 
   assert.equal(draftCalls.length, 0);
+});
+
+test("/ralph --path preserves explicit thinking level from the active model", async (t) => {
+  const cwd = createTempDir();
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const task = "reverse engineer this app";
+  const target = createTarget(cwd, task);
+  const draftPlan = makeDraftPlan(task, target, "llm-strengthened", cwd);
+  const existingDir = join(cwd, "thinking-task");
+  const existingRalphPath = join(existingDir, "RALPH.md");
+  mkdirSync(existingDir, { recursive: true });
+  writeFileSync(existingRalphPath, draftPlan.content, "utf8");
+
+  const capturedConfigs: RunnerConfig[] = [];
+  const harness = createHarness({
+    runRalphLoopFn: async (config: RunnerConfig) => {
+      capturedConfigs.push(config);
+      return { status: "complete", iterations: [], totalDurationMs: 0 };
+    },
+  });
+
+  const handler = harness.handler("ralph");
+  const ctx = {
+    cwd,
+    hasUI: false,
+    ui: {
+      notify: () => undefined,
+      select: async () => {
+        throw new Error("should not show review UI for existing RALPH.md");
+      },
+      input: async () => undefined,
+      editor: async () => undefined,
+      setStatus: () => undefined,
+    },
+    model: { provider: "anthropic", id: "claude-sonnet-4-5", reasoning: true },
+    sessionManager: { getEntries: () => [], getSessionFile: () => undefined },
+    newSession: async () => ({ cancelled: true }),
+    waitForIdle: async () => undefined,
+  };
+
+  await harness.event("thinking_level_select")({ level: "low" }, ctx);
+  await handler(`--path ${existingRalphPath}`, ctx);
+
+  assert.equal(capturedConfigs.length, 1);
+  assert.equal(capturedConfigs[0].modelPattern, "anthropic/claude-sonnet-4-5");
+  assert.equal(capturedConfigs[0].thinkingLevel, "low");
 });
 
 test("/ralph --path existing-task/RALPH.md with args resolves them safely at runtime", async (t) => {
