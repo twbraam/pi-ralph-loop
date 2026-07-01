@@ -128,6 +128,8 @@ export type RunnerActivity = {
   path?: string;
   changedFiles?: string[];
   textDelta?: string;
+  textOutput?: string;
+  recentTextOutputs?: string[];
 };
 
 // --- Task directory snapshot ---
@@ -152,7 +154,8 @@ const SNAPSHOT_POST_IDLE_POLL_WINDOW_MS = 100;
 const RALPH_PROGRESS_FILE = "RALPH_PROGRESS.md";
 const RALPH_PROGRESS_MAX_CHARS = 4096;
 const INTER_ITERATION_DELAY_POLL_INTERVAL_MS = 100;
-const AGENT_MESSAGE_UPDATE_MAX_CHARS = 500;
+const AGENT_MESSAGE_EVENT_MAX_CHARS = 500;
+const AGENT_RECENT_OUTPUT_COUNT = 3;
 const AGENT_MESSAGE_UPDATE_NOTIFY_INTERVAL_MS = 1500;
 const LIVE_FILE_POLL_INTERVAL_MS = 1000;
 
@@ -360,10 +363,10 @@ function displayRunnerPath(cwd: string, filePath: string): string {
   return filePath;
 }
 
-function truncateActivityText(text: string): { text: string; truncated?: true } {
+function truncateEventText(text: string): { text: string; truncated?: true } {
   const normalized = text.replace(/\s+/g, " ").trim();
-  if (normalized.length <= AGENT_MESSAGE_UPDATE_MAX_CHARS) return { text: normalized };
-  return { text: `${normalized.slice(0, AGENT_MESSAGE_UPDATE_MAX_CHARS)}...`, truncated: true };
+  if (normalized.length <= AGENT_MESSAGE_EVENT_MAX_CHARS) return { text: normalized };
+  return { text: `${normalized.slice(0, AGENT_MESSAGE_EVENT_MAX_CHARS)}...`, truncated: true };
 }
 
 function extractAgentTextDelta(event: RpcEvent): string | undefined {
@@ -380,6 +383,64 @@ function extractAgentTextDelta(event: RpcEvent): string | undefined {
 
 function changedFileKey(changedFiles: string[]): string {
   return changedFiles.join("\0");
+}
+
+function extractAssistantTextFromMessages(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  const texts: string[] = [];
+  for (const msg of messages) {
+    if (
+      typeof msg !== "object" ||
+      msg === null ||
+      !("role" in msg) ||
+      (msg as Record<string, unknown>).role !== "assistant" ||
+      !("content" in msg)
+    ) {
+      continue;
+    }
+    const content = (msg as Record<string, unknown>).content;
+    if (typeof content === "string") {
+      texts.push(content);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (
+        typeof block === "object" &&
+        block !== null &&
+        "type" in block &&
+        (block as Record<string, unknown>).type === "text" &&
+        "text" in block
+      ) {
+        texts.push(String((block as Record<string, unknown>).text));
+      }
+    }
+  }
+  const text = texts.join("");
+  return text.length > 0 ? text : undefined;
+}
+
+function markdownFenceFor(value: string): string {
+  let longestRun = 0;
+  for (const match of value.matchAll(/`+/g)) {
+    longestRun = Math.max(longestRun, match[0].length);
+  }
+  return "`".repeat(Math.max(3, longestRun + 1));
+}
+
+function literalOutputBlock(output: string): string {
+  const normalized = output.replace(/\r\n/g, "\n").trimEnd();
+  const fence = markdownFenceFor(normalized);
+  return `${fence}text\n${normalized}\n${fence}`;
+}
+
+function formatRecentAgentOutputs(iteration: number, maxIterations: number, recentOutputs: string[]): string {
+  const header = `Iteration ${iteration}/${maxIterations}: agent output (latest ${recentOutputs.length})`;
+  const sections = recentOutputs.map((output, index) => {
+    const label = recentOutputs.length === 1 ? "Output" : `Output ${index + 1}`;
+    return `${label}:\n${literalOutputBlock(output)}`;
+  });
+  return [header, ...sections].join("\n\n");
 }
 
 const COMMAND_OUTPUT_PREVIEW_MAX_CHARS = 500;
@@ -872,6 +933,33 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       }, 500);
       let lastMessageUpdateNotifyMs = 0;
       let lastLiveChangedFilesKey = "";
+      let agentVisibleOutput = "";
+      const recentAgentOutputs: string[] = [];
+      const pushRecentAgentOutput = (output: string): string[] => {
+        const normalized = output.trim();
+        if (!normalized) return recentAgentOutputs;
+        if (recentAgentOutputs[recentAgentOutputs.length - 1] !== normalized) {
+          recentAgentOutputs.push(normalized);
+          while (recentAgentOutputs.length > AGENT_RECENT_OUTPUT_COUNT) recentAgentOutputs.shift();
+        }
+        return recentAgentOutputs;
+      };
+      const emitRecentAgentOutputs = (timestamp: string, output: string, textDelta?: string): void => {
+        const recentTextOutputs = [...pushRecentAgentOutput(output)];
+        if (recentTextOutputs.length === 0) return;
+        emitActivity({
+          type: "agent.message_update",
+          timestamp,
+          iteration: i,
+          maxIterations: currentMaxIterations,
+          loopToken,
+          level: "info",
+          ...(textDelta !== undefined ? { textDelta } : {}),
+          textOutput: output,
+          recentTextOutputs,
+          message: formatRecentAgentOutputs(i, currentMaxIterations, recentTextOutputs),
+        });
+      };
       let liveFilePollBusy = false;
       const emitWorkspaceFilesChanged = (changedFiles: string[]) => {
         if (changedFiles.length === 0) return;
@@ -955,7 +1043,8 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
 
             const textDelta = extractAgentTextDelta(event);
             if (textDelta !== undefined && textDelta.trim().length > 0) {
-              const bounded = truncateActivityText(textDelta);
+              agentVisibleOutput += textDelta;
+              const bounded = truncateEventText(textDelta);
               logRunnerEvent(taskDir, {
                 type: "agent.message_update",
                 timestamp,
@@ -967,21 +1056,18 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
               const nowMs = Date.now();
               if (nowMs - lastMessageUpdateNotifyMs >= AGENT_MESSAGE_UPDATE_NOTIFY_INTERVAL_MS) {
                 lastMessageUpdateNotifyMs = nowMs;
-                emitActivity({
-                  type: "agent.message_update",
-                  timestamp,
-                  iteration: i,
-                  maxIterations: currentMaxIterations,
-                  loopToken,
-                  level: "info",
-                  textDelta: bounded.text,
-                  message: `Iteration ${i}/${currentMaxIterations}: agent says: ${bounded.text}`,
-                });
+                emitRecentAgentOutputs(timestamp, agentVisibleOutput, textDelta);
               }
               return;
             }
 
             if (event.type === "agent_end") {
+              const finalAssistantText = extractAssistantTextFromMessages(event.messages);
+              const finalVisibleOutput = finalAssistantText ?? agentVisibleOutput;
+              if (finalVisibleOutput.trim().length > 0) {
+                agentVisibleOutput = finalVisibleOutput;
+                emitRecentAgentOutputs(timestamp, agentVisibleOutput);
+              }
               emitActivity({
                 type: "agent.ended",
                 timestamp,

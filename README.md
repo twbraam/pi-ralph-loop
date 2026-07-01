@@ -153,6 +153,8 @@ my-task/
 
 Put scripts, reference docs, and data files alongside `RALPH.md`. The agent can read them every iteration. `RALPH_PROGRESS.md` is injected as rolling memory — the loop reads and writes it between iterations. `starting_prompts/iteration_<n>.md` captures the rendered Ralph prompt and final child system prompt for the latest run of each iteration number. Archived runs move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/`.
 
+During a run, `/ralph` surfaces visible agent activity as it streams: command evidence, prompt export paths, file changes, and the latest three full assistant output snapshots. Output snapshots are rendered as fenced literal text so newlines and special characters display as written. This is the model’s visible output, not hidden chain-of-thought.
+
 ## RALPH.md format
 
 YAML header (configuration) + Markdown body (the prompt). The header uses `snake_case` keys. Common camelCase aliases are accepted for compatibility, but new `RALPH.md` files should use the documented `snake_case` form.

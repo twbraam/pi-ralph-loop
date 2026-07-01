@@ -2459,6 +2459,63 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRalphLoop reports the last three full assistant output snapshots", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }).replace("Task: Do something", "Task: Full output activity case"));
+
+    const scriptPath = join(taskDir, "mock-pi-full-output-activity.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_start"}'
+echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"first line\\n"}}'
+sleep 2
+echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"second line\\n"}}'
+sleep 2
+echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"third line\\n"}}'
+sleep 2
+echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"fourth line with <tag> {json} \\"quotes\\" and ```ticks```\\n"}}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"first line\\nsecond line\\nthird line\\nfourth line with <tag> {json} \\"quotes\\" and ```ticks```\\n"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const activities: Array<{ type: string; message: string; recentTextOutputs?: string[]; textOutput?: string }> = [];
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 10,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+      onActivity(activity) {
+        activities.push(activity);
+      },
+    });
+
+    const messageUpdates = activities.filter((activity) => activity.type === "agent.message_update");
+    const latestUpdate = messageUpdates[messageUpdates.length - 1];
+    assert.ok(latestUpdate);
+    assert.deepEqual(latestUpdate.recentTextOutputs, [
+      "first line\nsecond line",
+      "first line\nsecond line\nthird line",
+      "first line\nsecond line\nthird line\nfourth line with <tag> {json} \"quotes\" and ```ticks```",
+    ]);
+    assert.equal(latestUpdate.textOutput, "first line\nsecond line\nthird line\nfourth line with <tag> {json} \"quotes\" and ```ticks```\n");
+    assert.match(latestUpdate.message, /agent output \(latest 3\)/);
+    assert.match(latestUpdate.message, /Output 1:\n```text\nfirst line\nsecond line\n```/);
+    assert.match(latestUpdate.message, /Output 3:\n````text\nfirst line\nsecond line\nthird line\nfourth line with <tag> \{json\} "quotes" and ```ticks```\n````/);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop blocks disallowed frontmatter commands when shell allowlist is active", async () => {
   const taskDir = createTempDir();
   try {
