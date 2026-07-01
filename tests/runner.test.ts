@@ -2360,6 +2360,105 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
   }
 });
 
+test("runRalphLoop writes the starting prompt before the RPC child runs", async () => {
+  const taskDir = createTempDir();
+  const observerDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }).replace("Task: Do something", "Task: Prompt seed case"));
+    const observerPath = join(observerDir, "seen.txt");
+
+    const scriptPath = join(taskDir, "mock-pi-starting-prompt.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+if grep -q "Task: Prompt seed case" "${taskDir}/starting_prompts/iteration_1.md"; then
+  echo "seen" > "${observerPath}"
+else
+  echo "missing" > "${observerPath}"
+fi
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const result = await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+    });
+
+    assert.equal(readFileSync(observerPath, "utf8").trim(), "seen");
+    const promptPath = join(taskDir, "starting_prompts", "iteration_1.md");
+    const raw = readFileSync(promptPath, "utf8");
+    assert.match(raw, /Rendered Ralph Prompt/);
+    assert.match(raw, /Task: Prompt seed case/);
+    assert.equal(result.iterations[0]?.changedFiles.includes("starting_prompts/iteration_1.md"), false);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(observerDir, { recursive: true, force: true });
+  }
+});
+
+test("runRalphLoop emits live activity for agent stream and file changes", async () => {
+  const taskDir = createTempDir();
+  try {
+    const ralphPath = writeRalphMd(taskDir, minimalRalphMd({ max_iterations: 1 }).replace("Task: Do something", "Task: Live activity case"));
+
+    const scriptPath = join(taskDir, "mock-pi-live-activity.sh");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+read line
+echo '{"type":"response","command":"prompt","success":true}'
+echo '{"type":"agent_start"}'
+echo '{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"checking files"}}'
+mkdir -p "${taskDir}/notes"
+echo "findings" > "${taskDir}/notes/findings.md"
+echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"done"}]}]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const activities: Array<{ type: string; message: string; changedFiles?: string[]; textDelta?: string }> = [];
+    await runRalphLoop({
+      ralphPath,
+      cwd: taskDir,
+      timeout: 5,
+      maxIterations: 1,
+      guardrails: { blockCommands: [], protectedFiles: [] },
+      spawnCommand: "bash",
+      spawnArgs: [scriptPath],
+      runCommandsFn: async () => [],
+      pi: makeMockPi(),
+      onActivity(activity) {
+        activities.push(activity);
+      },
+    });
+
+    assert.ok(activities.some((activity) => activity.type === "starting_prompt.written"));
+    assert.ok(activities.some((activity) => activity.type === "agent.started"));
+    assert.ok(activities.some((activity) => activity.type === "agent.message_update" && activity.textDelta === "checking files"));
+    assert.ok(activities.some((activity) => activity.type === "agent.ended"));
+    assert.ok(activities.some((activity) => activity.type === "workspace.files.changed" && activity.changedFiles?.includes("notes/findings.md")));
+
+    const eventTypes = readRunnerEvents(taskDir).map((event) => event.type);
+    assert.ok(eventTypes.includes("starting_prompt.written"));
+    assert.ok(eventTypes.includes("agent.started"));
+    assert.ok(eventTypes.includes("agent.message_update"));
+    assert.ok(eventTypes.includes("workspace.files.changed"));
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
 test("runRalphLoop blocks disallowed frontmatter commands when shell allowlist is active", async () => {
   const taskDir = createTempDir();
   try {
@@ -2666,4 +2765,3 @@ echo '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"te
     rmSync(taskDir, { recursive: true, force: true });
   }
 });
-

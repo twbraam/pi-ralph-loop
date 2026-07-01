@@ -140,6 +140,8 @@ my-task/
 ├── check-coverage.sh      ← helper script (optional)
 ├── testing-conventions.md ← reference doc (optional)
 ├── RALPH_PROGRESS.md      ← rolling memory (auto-managed)
+├── starting_prompts/      ← per-iteration starting context (auto-managed)
+│   └── iteration_1.md
 ├── .ralph-runner/         ← live run state (auto-managed)
 │   ├── status.json
 │   ├── iterations.jsonl
@@ -149,7 +151,7 @@ my-task/
     └── <ISO>/
 ```
 
-Put scripts, reference docs, and data files alongside `RALPH.md`. The agent can read them every iteration. `RALPH_PROGRESS.md` is injected as rolling memory — the loop reads and writes it between iterations. Archived runs move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/`.
+Put scripts, reference docs, and data files alongside `RALPH.md`. The agent can read them every iteration. `RALPH_PROGRESS.md` is injected as rolling memory — the loop reads and writes it between iterations. `starting_prompts/iteration_<n>.md` captures the rendered Ralph prompt and final child system prompt for the latest run of each iteration number. Archived runs move `.ralph-runner/` into `.ralph-runner-archive/<ISO>/`.
 
 ## RALPH.md format
 
@@ -443,11 +445,13 @@ Stop with <promise>DONE</promise> when MIGRATION_NOTES.md exists, all tests pass
 | `transcripts/` | Per-iteration markdown transcripts |
 | `active-loops/` | Registry of running loops (pruned after 30 minutes) |
 
+`starting_prompts/iteration_<n>.md` lives beside `.ralph-runner/`. It records the starting context for each iteration: the rendered prompt sent to the child process and, once the child starts, the final system prompt after Ralph Loop Context injection.
+
 ### Log export
 
 `/ralph-status --summary <task>` builds a deterministic summary from `RALPH.md`, `RALPH_PROGRESS.md`, durable status, iteration/event JSONL, and transcript references. It is intended for handoff, review, and compaction-safe context without relying on an LLM summary.
 
-`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, and `transcripts/` to a new or empty destination directory, then generates a fresh `final-summary.md`. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Add `--report` to generate `report.html`, an escaped static HTML view derived from the copied artifacts. JSONL files remain canonical; there is no server or SSE dependency. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
+`/ralph-logs` copies `status.json`, `iterations.jsonl`, `events.jsonl`, `transcripts/`, and `starting_prompts/` to a new or empty destination directory, then generates a fresh `final-summary.md`. Use a positional task path or `--path <task folder or RALPH.md>`; use `--dest <dir>` to choose the export directory. Short aliases `-p` and `-d` are also supported. Add `--report` to generate `report.html`, an escaped static HTML view derived from the copied artifacts. JSONL files remain canonical; there is no server or SSE dependency. Skips symlinks and excludes control files. Default destination: `./ralph-logs-<ISO-timestamp>`.
 
 ## Termination statuses
 

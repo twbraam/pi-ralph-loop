@@ -481,16 +481,15 @@ function renderGuardrails(status: JsonRecord): string {
 </div>`;
 }
 
-function listTranscripts(artifactsDir: string): string[] {
-  const transcriptsDir = join(artifactsDir, "transcripts");
-  if (!existsSync(transcriptsDir)) return [];
+function listRegularFiles(dirPath: string): string[] {
+  if (!existsSync(dirPath)) return [];
   try {
-    const dirStat = lstatSync(transcriptsDir);
+    const dirStat = lstatSync(dirPath);
     if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return [];
-    return readdirSync(transcriptsDir)
+    return readdirSync(dirPath)
       .filter((entry) => {
         try {
-          const stat = lstatSync(join(transcriptsDir, entry));
+          const stat = lstatSync(join(dirPath, entry));
           return stat.isFile() && !stat.isSymbolicLink();
         } catch {
           return false;
@@ -502,13 +501,23 @@ function listTranscripts(artifactsDir: string): string[] {
   }
 }
 
-function renderArtifactLinks(transcripts: string[]): string {
+function listTranscripts(artifactsDir: string): string[] {
+  return listRegularFiles(join(artifactsDir, "transcripts"));
+}
+
+function listStartingPrompts(artifactsDir: string): string[] {
+  return listRegularFiles(join(artifactsDir, "starting_prompts")).filter((entry) => /^iteration_\d+\.md$/.test(entry));
+}
+
+function renderArtifactLinks(transcripts: string[], startingPrompts: string[]): string {
   const transcriptLinks = transcripts.map((file) => `<a href="${escapeAttr(`transcripts/${encodeURIComponent(file)}`)}">${escapeHtml(file)}</a>`).join("\n      ");
+  const promptLinks = startingPrompts.map((file) => `<a href="${escapeAttr(`starting_prompts/${encodeURIComponent(file)}`)}">${escapeHtml(`starting_prompts/${file}`)}</a>`).join("\n      ");
   return `<div class="artifact-links">
     <a href="status.json">status.json</a>
     <a href="iterations.jsonl">iterations.jsonl</a>
     <a href="events.jsonl">events.jsonl</a>
     ${transcriptLinks}
+    ${promptLinks}
   </div>`;
 }
 
@@ -525,8 +534,8 @@ function renderRawArtifact(name: string, artifact: ArtifactText, missing: string
 </details>`;
 }
 
-function renderRawVault(status: ArtifactText, iterationsJsonl: ArtifactText, eventsJsonl: ArtifactText, transcripts: string[]): string {
-  return `${renderArtifactLinks(transcripts)}
+function renderRawVault(status: ArtifactText, iterationsJsonl: ArtifactText, eventsJsonl: ArtifactText, transcripts: string[], startingPrompts: string[]): string {
+  return `${renderArtifactLinks(transcripts, startingPrompts)}
 ${renderRawArtifact("status.json", status, "No status.json exported.")}
 ${renderRawArtifact("iterations.jsonl", iterationsJsonl, "No iterations.jsonl exported.")}
 ${renderRawArtifact("events.jsonl", eventsJsonl, "No events.jsonl exported.")}`;
@@ -644,6 +653,7 @@ function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iteration
   const lastIteration = latest(iterations);
   const gate = gateView(lastIteration);
   const transcripts = listTranscripts(artifactsDir);
+  const startingPrompts = listStartingPrompts(artifactsDir);
   const duration = durationBetween(status.startedAt, status.completedAt);
   const currentIteration = status.currentIteration ?? lastIteration?.iteration ?? iterationLines.length;
   const maxIterations = status.maxIterations ?? "?";
@@ -658,6 +668,7 @@ function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iteration
     { label: "Completed", value: formatTime(status.completedAt) },
     { label: "Duration", value: duration },
     { label: "Transcripts", value: String(transcripts.length) },
+    { label: "Starting prompts", value: String(startingPrompts.length) },
   ]);
 
   const identityFacts = renderFactGrid([
@@ -723,7 +734,7 @@ function buildHtml(artifactsDir: string, statusArtifact: ArtifactText, iteration
       ${renderSection("iterations", "Iteration ledger", renderIterationCards(iterations), "One ledger card per iteration. Status labels are derived from exported runner records.")}
       ${renderSection("files", "File evidence", renderFileEvidence(iterations), "Aggregate changed-file evidence from the iteration ledger.")}
       ${renderSection("events", "Event trace", renderEventTrace(events, parsedEvents.invalidLines), "Chronological runner events. Event names are preserved exactly as recorded.")}
-      ${renderSection("raw", "Raw evidence vault", renderRawVault(statusArtifact, iterationsArtifact, eventsArtifact, transcripts), "Canonical copied artifacts and transcripts. Inline report previews are escaped and bounded for audit.")}
+      ${renderSection("raw", "Raw evidence vault", renderRawVault(statusArtifact, iterationsArtifact, eventsArtifact, transcripts, startingPrompts), "Canonical copied artifacts, transcripts, and starting prompts. Inline report previews are escaped and bounded for audit.")}
     </div>
   </main>
 </body>

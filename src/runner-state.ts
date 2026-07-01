@@ -93,6 +93,46 @@ export type IterationStartedEvent = {
   completionPromise?: string;
 };
 
+export type StartingPromptWrittenEvent = {
+  type: "starting_prompt.written";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  path: string;
+};
+
+export type StartingPromptSystemPromptCapturedEvent = {
+  type: "starting_prompt.system_prompt_captured";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  path: string;
+};
+
+export type AgentStartedEvent = {
+  type: "agent.started";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+};
+
+export type AgentMessageUpdateEvent = {
+  type: "agent.message_update";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  textDelta: string;
+  textTruncated?: boolean;
+};
+
+export type WorkspaceFilesChangedEvent = {
+  type: "workspace.files.changed";
+  timestamp: string;
+  iteration: number;
+  loopToken: string;
+  changedFiles: string[];
+};
+
 export type DurableProgressObservedEvent = {
   type: "durable.progress.observed";
   timestamp: string;
@@ -201,6 +241,11 @@ export type RunnerFinishedEvent = {
 export type RunnerEvent =
   | RunnerStartedEvent
   | IterationStartedEvent
+  | StartingPromptWrittenEvent
+  | StartingPromptSystemPromptCapturedEvent
+  | AgentStartedEvent
+  | AgentMessageUpdateEvent
+  | WorkspaceFilesChangedEvent
   | IterationCompletedEvent
   | DurableProgressObservedEvent
   | DurableProgressMissingEvent
@@ -254,10 +299,33 @@ export type IterationTranscriptInput = {
   note?: string;
 };
 
+export type StartingPromptInput = {
+  iteration: number;
+  maxIterations: number;
+  loopToken: string;
+  cwd: string;
+  taskDir: string;
+  ralphPath: string;
+  renderedPrompt: string;
+  writtenAt?: string;
+};
+
+export type StartingSystemPromptInput = {
+  iteration: number;
+  maxIterations: number;
+  loopToken: string;
+  cwd: string;
+  taskDir: string;
+  ralphPath: string;
+  systemPrompt: string;
+  writtenAt?: string;
+};
+
 // --- Constants ---
 
 const RUNNER_DIR_NAME = ".ralph-runner";
 const TRANSCRIPTS_DIR = "transcripts";
+const STARTING_PROMPTS_DIR = "starting_prompts";
 const STATUS_FILE = "status.json";
 const ITERATIONS_FILE = "iterations.jsonl";
 const EVENTS_FILE = "events.jsonl";
@@ -272,6 +340,8 @@ const STATUS_FILE_MAX_BYTES = 64 * 1024;
 const JSONL_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const JSONL_ARTIFACT_MAX_RECORDS = 1000;
 const ACTIVE_LOOP_REGISTRY_MAX_BYTES = 64 * 1024;
+const STARTING_PROMPT_MAX_BYTES = 2 * 1024 * 1024;
+const FINAL_SYSTEM_PROMPT_HEADING = "## Final System Prompt";
 
 // --- Helper ---
 
@@ -281,6 +351,14 @@ function runnerDir(taskDir: string): string {
 
 function transcriptDir(taskDir: string): string {
   return join(runnerDir(taskDir), TRANSCRIPTS_DIR);
+}
+
+function startingPromptDir(taskDir: string): string {
+  return join(taskDir, STARTING_PROMPTS_DIR);
+}
+
+function startingPromptPath(taskDir: string, iteration: number): string {
+  return join(startingPromptDir(taskDir), `iteration_${iteration}.md`);
 }
 
 // --- Public API ---
@@ -401,6 +479,116 @@ function ensureTranscriptDir(taskDir: string): string {
     assertRegularDirectory(dir, "transcripts directory");
   }
   return dir;
+}
+
+function ensureStartingPromptDir(taskDir: string): string {
+  const dir = startingPromptDir(taskDir);
+  if (existsSync(dir)) {
+    assertRegularDirectory(dir, "starting_prompts directory");
+  } else {
+    mkdirSync(dir, { recursive: true });
+    assertRegularDirectory(dir, "starting_prompts directory");
+  }
+  return dir;
+}
+
+function assertValidStartingPromptIteration(iteration: number): void {
+  if (!Number.isInteger(iteration) || iteration <= 0) {
+    throw new Error(`Invalid starting prompt iteration: ${iteration}`);
+  }
+}
+
+function normalizePromptText(value: string): string {
+  return value.replace(/\r\n/g, "\n").trimEnd();
+}
+
+function markdownFenceFor(value: string): string {
+  let longestRun = 0;
+  for (const match of value.matchAll(/`+/g)) {
+    longestRun = Math.max(longestRun, match[0].length);
+  }
+  return "`".repeat(Math.max(3, longestRun + 1));
+}
+
+function markdownCodeBlock(value: string): string {
+  const normalized = normalizePromptText(value);
+  const fence = markdownFenceFor(normalized);
+  return `${fence}text\n${normalized}\n${fence}`;
+}
+
+function startingPromptHeader(input: Omit<StartingPromptInput, "renderedPrompt">, options: { finalSystemPromptCaptured: boolean }): string[] {
+  const writtenAt = input.writtenAt ?? new Date().toISOString();
+  return [
+    `# Ralph Starting Prompt: Iteration ${input.iteration}`,
+    "",
+    `- Loop token: ${input.loopToken}`,
+    `- Iteration: ${input.iteration}/${input.maxIterations}`,
+    `- Task directory: ${input.taskDir}`,
+    `- Working directory: ${input.cwd}`,
+    `- RALPH.md: ${input.ralphPath}`,
+    `- Written: ${writtenAt}`,
+    `- Updated: ${writtenAt}`,
+    "- Rendered prompt captured: yes",
+    `- Final system prompt captured: ${options.finalSystemPromptCaptured ? "yes" : "no"}`,
+  ];
+}
+
+function renderStartingPromptDocument(input: StartingPromptInput, options: { finalSystemPromptCaptured?: boolean } = {}): string {
+  return [
+    ...startingPromptHeader(input, { finalSystemPromptCaptured: options.finalSystemPromptCaptured === true }),
+    "",
+    "## Rendered Ralph Prompt",
+    "",
+    markdownCodeBlock(input.renderedPrompt),
+    "",
+  ].join("\n");
+}
+
+function stripFinalSystemPromptSection(raw: string): string {
+  const marker = `\n${FINAL_SYSTEM_PROMPT_HEADING}\n`;
+  const markerIndex = raw.indexOf(marker);
+  return (markerIndex >= 0 ? raw.slice(0, markerIndex) : raw).trimEnd();
+}
+
+function markSystemPromptCaptured(raw: string, updatedAt: string): string {
+  let next = raw.replace(/^- Updated: .*$/m, `- Updated: ${updatedAt}`);
+  if (next === raw) {
+    next = next.replace(/^- Written: .*$/m, (line) => `${line}\n- Updated: ${updatedAt}`);
+  }
+  const beforeFinalSystemPromptMarker = next;
+  next = next.replace(/^- Final system prompt captured: .*$/m, "- Final system prompt captured: yes");
+  if (next === beforeFinalSystemPromptMarker) {
+    next = `${next}\n- Final system prompt captured: yes`;
+  }
+  return next;
+}
+
+export function writeStartingPrompt(taskDir: string, input: StartingPromptInput): string {
+  assertValidStartingPromptIteration(input.iteration);
+  const dir = ensureStartingPromptDir(taskDir);
+  const filePath = join(dir, `iteration_${input.iteration}.md`);
+  writeFileReplacing(filePath, `${renderStartingPromptDocument(input)}\n`, "starting prompt file");
+  return filePath;
+}
+
+export function writeStartingSystemPrompt(taskDir: string, input: StartingSystemPromptInput): string {
+  assertValidStartingPromptIteration(input.iteration);
+  ensureStartingPromptDir(taskDir);
+  const filePath = startingPromptPath(taskDir, input.iteration);
+  const updatedAt = input.writtenAt ?? new Date().toISOString();
+  const existing = readRegularFileNoFollowBounded(filePath, STARTING_PROMPT_MAX_BYTES);
+  const base = existing ?? renderStartingPromptDocument({ ...input, renderedPrompt: "[rendered Ralph prompt unavailable]" });
+  const withoutSystemPrompt = stripFinalSystemPromptSection(markSystemPromptCaptured(base, updatedAt));
+  const contents = [
+    withoutSystemPrompt,
+    "",
+    FINAL_SYSTEM_PROMPT_HEADING,
+    "",
+    markdownCodeBlock(input.systemPrompt),
+    "",
+  ].join("\n");
+  writeFileReplacing(filePath, contents, "starting prompt file");
+  return filePath;
 }
 
 export function writeStatusFile(taskDir: string, status: RunnerStatusFile): void {
@@ -553,6 +741,39 @@ function isRunnerEvent(value: unknown): value is RunnerEvent {
         value.maxIterations > 0 &&
         isNumber(value.timeout) &&
         (value.completionPromise === undefined || isString(value.completionPromise))
+      );
+    case "starting_prompt.written":
+    case "starting_prompt.system_prompt_captured":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        isString(value.path)
+      );
+    case "agent.started":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken)
+      );
+    case "agent.message_update":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        isString(value.textDelta) &&
+        (value.textTruncated === undefined || typeof value.textTruncated === "boolean")
+      );
+    case "workspace.files.changed":
+      return (
+        isNumber(value.iteration) &&
+        Number.isInteger(value.iteration) &&
+        value.iteration > 0 &&
+        isString(value.loopToken) &&
+        isStringArray(value.changedFiles)
       );
     case "durable.progress.observed":
       return (

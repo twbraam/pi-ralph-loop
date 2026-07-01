@@ -28,6 +28,8 @@ import {
   recordActiveLoopStopRequest,
   writeActiveLoopRegistryEntry,
   writeIterationTranscript,
+  writeStartingPrompt,
+  writeStartingSystemPrompt,
   writeStatusFile,
 } from "../src/runner-state.ts";
 
@@ -679,6 +681,132 @@ test("writeIterationTranscript caps oversized command output", () => {
     assert.ok(raw.includes("original 20000 bytes"));
   } finally {
     rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("writeStartingPrompt writes and replaces latest iteration prompt", () => {
+  const taskDir = createTempDir();
+  try {
+    const promptPath = writeStartingPrompt(taskDir, {
+      iteration: 1,
+      maxIterations: 3,
+      loopToken: "loop-a",
+      cwd: taskDir,
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      renderedPrompt: "first prompt",
+      writtenAt: "2026-04-13T12:00:00.000Z",
+    });
+
+    assert.equal(promptPath, join(taskDir, "starting_prompts", "iteration_1.md"));
+    assert.match(readFileSync(promptPath, "utf8"), /first prompt/);
+
+    writeStartingPrompt(taskDir, {
+      iteration: 1,
+      maxIterations: 3,
+      loopToken: "loop-b",
+      cwd: taskDir,
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      renderedPrompt: "second prompt",
+      writtenAt: "2026-04-13T12:01:00.000Z",
+    });
+
+    const raw = readFileSync(promptPath, "utf8");
+    assert.match(raw, /Loop token: loop-b/);
+    assert.match(raw, /second prompt/);
+    assert.doesNotMatch(raw, /first prompt/);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("writeStartingSystemPrompt preserves rendered prompt and appends final system prompt", () => {
+  const taskDir = createTempDir();
+  try {
+    writeStartingPrompt(taskDir, {
+      iteration: 2,
+      maxIterations: 4,
+      loopToken: "loop-system",
+      cwd: taskDir,
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      renderedPrompt: "rendered prompt body",
+      writtenAt: "2026-04-13T12:00:00.000Z",
+    });
+
+    const promptPath = writeStartingSystemPrompt(taskDir, {
+      iteration: 2,
+      maxIterations: 4,
+      loopToken: "loop-system",
+      cwd: taskDir,
+      taskDir,
+      ralphPath: join(taskDir, "RALPH.md"),
+      systemPrompt: "final system prompt with Ralph Loop Context",
+      writtenAt: "2026-04-13T12:02:00.000Z",
+    });
+
+    const raw = readFileSync(promptPath, "utf8");
+    assert.match(raw, /Rendered Ralph Prompt/);
+    assert.match(raw, /rendered prompt body/);
+    assert.match(raw, /Final system prompt captured: yes/);
+    assert.match(raw, /Final System Prompt/);
+    assert.match(raw, /final system prompt with Ralph Loop Context/);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+  }
+});
+
+test("writeStartingPrompt rejects symlinked starting prompt targets", () => {
+  const taskDir = createTempDir();
+  const outsideDir = createTempDir();
+  try {
+    mkdirSync(join(taskDir, "starting_prompts"));
+    const outsideFile = join(outsideDir, "outside.md");
+    writeFileSync(outsideFile, "outside", "utf8");
+    symlinkSync(outsideFile, join(taskDir, "starting_prompts", "iteration_1.md"));
+
+    assert.throws(
+      () => writeStartingPrompt(taskDir, {
+        iteration: 1,
+        maxIterations: 1,
+        loopToken: "loop-symlink",
+        cwd: taskDir,
+        taskDir,
+        ralphPath: join(taskDir, "RALPH.md"),
+        renderedPrompt: "prompt",
+      }),
+      /Unsafe starting prompt file/,
+    );
+    assert.equal(readFileSync(outsideFile, "utf8"), "outside");
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("writeStartingPrompt rejects symlinked starting_prompts directory", () => {
+  const taskDir = createTempDir();
+  const outsideDir = createTempDir();
+  try {
+    symlinkSync(outsideDir, join(taskDir, "starting_prompts"), "dir");
+
+    assert.throws(
+      () => writeStartingPrompt(taskDir, {
+        iteration: 1,
+        maxIterations: 1,
+        loopToken: "loop-dir-symlink",
+        cwd: taskDir,
+        taskDir,
+        ralphPath: join(taskDir, "RALPH.md"),
+        renderedPrompt: "prompt",
+      }),
+      /Unsafe starting_prompts directory/,
+    );
+    assert.deepEqual(readdirSync(outsideDir), []);
+  } finally {
+    rmSync(taskDir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
   }
 });
 

@@ -37,6 +37,7 @@ import { runRalphLoop } from "./runner.ts";
 import { generateStaticRunnerReport } from "./runner-report.ts";
 import { buildRalphRunSummary } from "./runner-summary.ts";
 import {
+  appendRunnerEvent,
   checkStopSignal,
   createStopSignal,
   createCancelSignal,
@@ -47,6 +48,7 @@ import {
   readStatusFile,
   recordActiveLoopStopRequest,
   writeActiveLoopRegistryEntry,
+  writeStartingSystemPrompt,
   type ActiveLoopRegistryEntry,
   type IterationRecord,
 } from "./runner-state.ts";
@@ -514,6 +516,7 @@ const SNAPSHOT_IGNORED_DIR_NAMES = new Set([
   "dist",
   "build",
   ".ralph-runner",
+  "starting_prompts",
 ]);
 const SNAPSHOT_MAX_FILES = 200;
 const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
@@ -1481,7 +1484,7 @@ function countNonEmptyLines(filePath: string): number {
   return readFileSync(filePath, "utf8").split("\n").filter((line) => line.trim()).length;
 }
 
-function exportRalphLogs(taskDir: string, destDir: string, options: { report?: boolean } = {}): { iterations: number; events: number; transcripts: number; reportPath?: string } {
+function exportRalphLogs(taskDir: string, destDir: string, options: { report?: boolean } = {}): { iterations: number; events: number; transcripts: number; startingPrompts: number; reportPath?: string } {
   assertNoSymlinkedExistingPathSegments(taskDir, "task path");
   const runnerDir = join(taskDir, ".ralph-runner");
   assertNoSymlinkedExistingPathSegments(runnerDir, ".ralph-runner path");
@@ -1548,6 +1551,30 @@ function exportRalphLogs(taskDir: string, destDir: string, options: { report?: b
       }
     }
 
+    const startingPromptsDir = join(taskDir, "starting_prompts");
+    let startingPrompts = 0;
+    if (existsSync(startingPromptsDir)) {
+      assertNoSymlinkedExistingPathSegments(startingPromptsDir, "starting_prompts path");
+      const startingPromptsStat = lstatSync(startingPromptsDir);
+      if (startingPromptsStat.isDirectory() && !startingPromptsStat.isSymbolicLink()) {
+        const destStartingPrompts = prepareExportSubdirectory(preparedDest.stagingDir, "starting_prompts");
+        for (const entry of readdirSync(startingPromptsDir)) {
+          if (!/^iteration_\d+\.md$/.test(entry)) continue;
+          const srcPath = join(startingPromptsDir, entry);
+          let stat;
+          try {
+            stat = lstatSync(srcPath);
+          } catch {
+            continue;
+          }
+          if (stat.isFile() && !stat.isSymbolicLink()) {
+            copyExportFileNoOverwrite(srcPath, join(destStartingPrompts, entry), realpathSync(taskDir), stagingRootRealPath);
+            startingPrompts++;
+          }
+        }
+      }
+    }
+
     let reportPath: string | undefined;
     if (options.report) {
       generateStaticRunnerReport(preparedDest.stagingDir);
@@ -1560,7 +1587,7 @@ function exportRalphLogs(taskDir: string, destDir: string, options: { report?: b
     finalizeExportDirectory(preparedDest);
     finalized = true;
 
-    return { iterations, events, transcripts, ...(reportPath ? { reportPath } : {}) };
+    return { iterations, events, transcripts, startingPrompts, ...(reportPath ? { reportPath } : {}) };
   } finally {
     if (!finalized) {
       rmSync(preparedDest.stagingDir, { recursive: true, force: true });
@@ -2140,6 +2167,10 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
           const runtimeUi = resolveSessionUi(currentCommandCtx);
           runtimeUi.notify(message, level);
         },
+        onActivity(activity) {
+          const runtimeUi = resolveSessionUi(currentCommandCtx);
+          runtimeUi.notify(activity.message, activity.level);
+        },
         onIterationComplete(record) {
           loopState.iteration = record.iteration;
           loopState.noProgressStreak = record.noProgressStreak;
@@ -2394,10 +2425,40 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       summaryCount: summaries.length,
     });
 
+    const systemPrompt =
+      event.systemPrompt +
+      `\n\n## Ralph Loop Context\nIteration ${persisted?.iteration ?? 0}/${persisted?.maxIterations ?? 0}\nTask directory: ${taskDirLabel}\n\nPrevious iterations:\n${history}\n\n${lastFeedback}\nPersist findings to files in the Ralph task directory. Do not only report them in chat. If you make progress this iteration, leave durable file changes and mention the changed paths.\nDo not repeat completed work. Check git log for recent changes.`;
+
+    if (persisted.taskDir && persisted.iteration && persisted.loopToken) {
+      try {
+        const promptPath = writeStartingSystemPrompt(persisted.taskDir, {
+          iteration: persisted.iteration,
+          maxIterations: persisted.maxIterations ?? 0,
+          loopToken: persisted.loopToken,
+          cwd: persisted.cwd ?? persisted.taskDir,
+          taskDir: persisted.taskDir,
+          ralphPath: join(persisted.taskDir, "RALPH.md"),
+          systemPrompt,
+        });
+        appendRunnerEvent(persisted.taskDir, {
+          type: "starting_prompt.system_prompt_captured",
+          timestamp: new Date().toISOString(),
+          iteration: persisted.iteration,
+          loopToken: persisted.loopToken,
+          path: promptPath,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          process.stderr.write(`Ralph starting prompt capture failed: ${message}\n`);
+        } catch {
+          // Best-effort surfacing only.
+        }
+      }
+    }
+
     return {
-      systemPrompt:
-        event.systemPrompt +
-        `\n\n## Ralph Loop Context\nIteration ${persisted?.iteration ?? 0}/${persisted?.maxIterations ?? 0}\nTask directory: ${taskDirLabel}\n\nPrevious iterations:\n${history}\n\n${lastFeedback}\nPersist findings to files in the Ralph task directory. Do not only report them in chat. If you make progress this iteration, leave durable file changes and mention the changed paths.\nDo not repeat completed work. Check git log for recent changes.`,
+      systemPrompt,
     };
   });
 
@@ -2852,7 +2913,8 @@ export default function (pi: ExtensionAPI, services: RegisterRalphCommandService
       try {
         const result = exportRalphLogs(taskDir, destDir, { report: parsed.report });
         const reportNote = result.reportPath ? ` with static report ${displayPath(ctx.cwd, result.reportPath)}` : "";
-        ctx.ui.notify(`Exported ${result.iterations} iteration records, ${result.events} events, ${result.transcripts} transcripts to ${displayPath(ctx.cwd, destDir)}${reportNote}`, "info");
+        const promptsNote = result.startingPrompts > 0 ? `, ${result.startingPrompts} starting prompts` : "";
+        ctx.ui.notify(`Exported ${result.iterations} iteration records, ${result.events} events, ${result.transcripts} transcripts${promptsNote} to ${displayPath(ctx.cwd, destDir)}${reportNote}`, "info");
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Log export failed: ${message}`, "error");

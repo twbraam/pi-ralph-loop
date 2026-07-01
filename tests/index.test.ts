@@ -1096,6 +1096,7 @@ test("/ralph-logs exports artifacts and static report from a task with .ralph-ru
 
   const taskDir = join(cwd, "my-task");
   mkdirSync(join(taskDir, ".ralph-runner", "transcripts"), { recursive: true });
+  mkdirSync(join(taskDir, "starting_prompts"), { recursive: true });
   writeFileSync(join(taskDir, "RALPH.md"), "---\nmax_iterations: 10\ntimeout: 120\ncommands: []\n---\n# my-task\n", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "status.json"), JSON.stringify({ status: "running" }), "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "iterations.jsonl"), "{\"iteration\":1}\n{\"iteration\":2}\n", "utf8");
@@ -1103,6 +1104,7 @@ test("/ralph-logs exports artifacts and static report from a task with .ralph-ru
   writeFileSync(join(taskDir, ".ralph-runner", "final-summary.md"), "# Stale previous summary\nsecret stale data\n", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "one.txt"), "one", "utf8");
   writeFileSync(join(taskDir, ".ralph-runner", "transcripts", "two.txt"), "two", "utf8");
+  writeFileSync(join(taskDir, "starting_prompts", "iteration_1.md"), "# prompt one\n", "utf8");
 
   const notifications: Array<{ message: string; level: string }> = [];
   const harness = createHarness();
@@ -1131,10 +1133,12 @@ test("/ralph-logs exports artifacts and static report from a task with .ralph-ru
   assert.doesNotMatch(exportedSummary, /Stale previous summary|secret stale data/);
   assert.equal(readFileSync(join(exportedDir, "transcripts", "one.txt"), "utf8"), "one");
   assert.equal(readFileSync(join(exportedDir, "transcripts", "two.txt"), "utf8"), "two");
+  assert.equal(readFileSync(join(exportedDir, "starting_prompts", "iteration_1.md"), "utf8"), "# prompt one\n");
   const reportHtml = readFileSync(join(exportedDir, "report.html"), "utf8");
   assert.match(reportHtml, /Ralph Loop Dossier/);
   assert.match(reportHtml, /href="transcripts\/one\.txt"/);
-  assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts to ./exported with static report ./exported/report.html")));
+  assert.match(reportHtml, /href="starting_prompts\/iteration_1\.md"/);
+  assert.ok(notifications.some(({ message, level }) => level === "info" && message.includes("Exported 2 iteration records, 1 events, 2 transcripts, 1 starting prompts to ./exported with static report ./exported/report.html")));
 });
 
 test("/ralph-logs fails when no .ralph-runner/ exists", async (t) => {
@@ -4343,6 +4347,11 @@ test("/ralph subprocess child injects durable loop context into before_agent_sta
   assert.match(result.systemPrompt, /Task directory: \.\/subprocess-child-task/);
   assert.match(result.systemPrompt, /Previous iterations:\n- Iteration 1: 1s — durable progress \(notes\/findings\.md\); no-progress streak: 0/);
   assert.match(result.systemPrompt, /Last iteration durable progress: notes\/findings\.md\./);
+  const startingPrompt = readFileSync(join(taskDir, "starting_prompts", "iteration_2.md"), "utf8");
+  assert.match(startingPrompt, /Final system prompt captured: yes/);
+  assert.match(startingPrompt, /## Final System Prompt/);
+  assert.match(startingPrompt, /Base prompt/);
+  assert.match(startingPrompt, /Ralph Loop Context/);
   assert.deepEqual(proofEntries.map((entry) => entry.customType), ["ralph-steering-injected", "ralph-loop-context-injected"]);
 });
 

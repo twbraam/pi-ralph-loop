@@ -32,6 +32,41 @@ type ExpectedRunnerEvent =
       completionPromise?: string;
     }
   | {
+      type: "starting_prompt.written";
+      timestamp: string;
+      iteration: number;
+      loopToken: string;
+      path: string;
+    }
+  | {
+      type: "starting_prompt.system_prompt_captured";
+      timestamp: string;
+      iteration: number;
+      loopToken: string;
+      path: string;
+    }
+  | {
+      type: "agent.started";
+      timestamp: string;
+      iteration: number;
+      loopToken: string;
+    }
+  | {
+      type: "agent.message_update";
+      timestamp: string;
+      iteration: number;
+      loopToken: string;
+      textDelta: string;
+      textTruncated?: boolean;
+    }
+  | {
+      type: "workspace.files.changed";
+      timestamp: string;
+      iteration: number;
+      loopToken: string;
+      changedFiles: string[];
+    }
+  | {
       type: "iteration.completed";
       timestamp: string;
       iteration: number;

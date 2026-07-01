@@ -37,9 +37,11 @@ import {
   recordActiveLoopStopObservation,
   writeActiveLoopRegistryEntry,
   writeIterationTranscript,
+  writeStartingPrompt,
   writeStatusFile,
 } from "./runner-state.ts";
 import {
+  type RpcEvent,
   type RpcSubprocessResult,
   runRpcIteration,
 } from "./runner-rpc.ts";
@@ -84,6 +86,7 @@ export type RunnerConfig = {
   onIterationComplete?: (record: IterationRecord) => void;
   onStatusChange?: (status: RunnerStatus) => void;
   onNotify?: (message: string, level: "info" | "warning" | "error") => void;
+  onActivity?: (activity: RunnerActivity) => void;
   /** Extension API for running commands */
   runCommandsFn?: (
     commands: CommandDef[],
@@ -105,6 +108,28 @@ export type RunnerResult = {
   totalDurationMs: number;
 };
 
+export type RunnerActivity = {
+  type:
+    | "status.written"
+    | "commands.completed"
+    | "starting_prompt.written"
+    | "agent.started"
+    | "agent.activity"
+    | "agent.message_update"
+    | "agent.ended"
+    | "workspace.files.changed"
+    | "transcript.written";
+  timestamp: string;
+  iteration?: number;
+  maxIterations?: number;
+  loopToken?: string;
+  message: string;
+  level: "info" | "warning" | "error";
+  path?: string;
+  changedFiles?: string[];
+  textDelta?: string;
+};
+
 // --- Task directory snapshot ---
 
 const SNAPSHOT_IGNORED_DIR_NAMES = new Set([
@@ -117,6 +142,7 @@ const SNAPSHOT_IGNORED_DIR_NAMES = new Set([
   "dist",
   "build",
   ".ralph-runner",
+  "starting_prompts",
 ]);
 
 const SNAPSHOT_MAX_FILES = 200;
@@ -126,6 +152,9 @@ const SNAPSHOT_POST_IDLE_POLL_WINDOW_MS = 100;
 const RALPH_PROGRESS_FILE = "RALPH_PROGRESS.md";
 const RALPH_PROGRESS_MAX_CHARS = 4096;
 const INTER_ITERATION_DELAY_POLL_INTERVAL_MS = 100;
+const AGENT_MESSAGE_UPDATE_MAX_CHARS = 500;
+const AGENT_MESSAGE_UPDATE_NOTIFY_INTERVAL_MS = 1500;
+const LIVE_FILE_POLL_INTERVAL_MS = 1000;
 
 export type WorkspaceSnapshot = {
   files: Map<string, string>;
@@ -323,6 +352,34 @@ export function summarizeChangedFiles(changedFiles: string[]): string {
   const visible = changedFiles.slice(0, 5);
   if (visible.length === changedFiles.length) return visible.join(", ");
   return `${visible.join(", ")} (+${changedFiles.length - visible.length} more)`;
+}
+
+function displayRunnerPath(cwd: string, filePath: string): string {
+  const relPath = normalizeSnapshotPath(relative(cwd, filePath));
+  if (relPath && relPath !== "." && !relPath.startsWith("..") && !isAbsolute(relPath)) return `./${relPath}`;
+  return filePath;
+}
+
+function truncateActivityText(text: string): { text: string; truncated?: true } {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= AGENT_MESSAGE_UPDATE_MAX_CHARS) return { text: normalized };
+  return { text: `${normalized.slice(0, AGENT_MESSAGE_UPDATE_MAX_CHARS)}...`, truncated: true };
+}
+
+function extractAgentTextDelta(event: RpcEvent): string | undefined {
+  if (event.type !== "message_update") return undefined;
+  const assistantMessageEvent = event.assistantMessageEvent;
+  if (typeof assistantMessageEvent === "object" && assistantMessageEvent !== null) {
+    const candidate = assistantMessageEvent as Record<string, unknown>;
+    if (typeof candidate.delta === "string") return candidate.delta;
+    if (typeof candidate.text === "string") return candidate.text;
+  }
+  const delta = event.delta;
+  return typeof delta === "string" ? delta : undefined;
+}
+
+function changedFileKey(changedFiles: string[]): string {
+  return changedFiles.join("\0");
 }
 
 const COMMAND_OUTPUT_PREVIEW_MAX_CHARS = 500;
@@ -523,6 +580,7 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
     onIterationComplete,
     onStatusChange,
     onNotify,
+    onActivity,
     runCommandsFn,
     pi,
     runtimeArgs: initialRuntimeArgs = {},
@@ -545,6 +603,13 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   let noProgressStreak = 0;
   const iterations: IterationRecord[] = [];
   const startMs = Date.now();
+  const emitActivity = (activity: Omit<RunnerActivity, "timestamp"> & { timestamp?: string }): void => {
+    const { timestamp, ...rest } = activity;
+    onActivity?.({
+      timestamp: timestamp ?? new Date().toISOString(),
+      ...rest,
+    });
+  };
 
   // Initialize durable state
   ensureRunnerDir(taskDir);
@@ -584,6 +649,13 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
   }, 60_000);
   activeLoopHeartbeat.unref?.();
   writeStatusFile(taskDir, initialStatus);
+  emitActivity({
+    type: "status.written",
+    loopToken,
+    level: "info",
+    message: `Status updated: initializing (${displayRunnerPath(cwd, join(taskDir, ".ralph-runner", "status.json"))})`,
+    path: join(taskDir, ".ralph-runner", "status.json"),
+  });
   syncActiveLoopRegistry(initialStatus);
   logRunnerEvent(taskDir, {
     type: "runner.started",
@@ -661,6 +733,15 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         guardrails: currentGuardrails,
       };
       writeStatusFile(taskDir, runningStatus);
+      emitActivity({
+        type: "status.written",
+        iteration: i,
+        maxIterations: currentMaxIterations,
+        loopToken,
+        level: "info",
+        message: `Iteration ${i}/${currentMaxIterations}: status updated to running`,
+        path: join(taskDir, ".ralph-runner", "status.json"),
+      });
       syncActiveLoopRegistry(runningStatus);
       onStatusChange?.("running");
       onIterationStart?.(i, currentMaxIterations);
@@ -685,6 +766,16 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
         : [];
       const commandOutcomes = commandOutcomeRecords(commandsOutput);
       const nonEmptyCommandOutcomes = commandOutcomes.length > 0 ? commandOutcomes : undefined;
+      emitActivity({
+        type: "commands.completed",
+        iteration: i,
+        maxIterations: currentMaxIterations,
+        loopToken,
+        level: commandOutcomes.some((outcome) => outcome.status !== "ok") ? "warning" : "info",
+        message: commandOutcomes.length > 0
+          ? `Iteration ${i}/${currentMaxIterations}: command evidence ${commandOutcomes.map((outcome) => `${outcome.name}:${outcome.status}`).join(", ")}`
+          : `Iteration ${i}/${currentMaxIterations}: no pre-agent commands configured`,
+      });
 
       // Before snapshot
       const snapshotBefore = captureTaskDirectorySnapshot(ralphPath);
@@ -715,9 +806,49 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           completionPromise: currentCompletionPromise,
         },
       );
+      let startingPromptPath: string | undefined;
+      try {
+        startingPromptPath = writeStartingPrompt(taskDir, {
+          iteration: i,
+          maxIterations: currentMaxIterations,
+          loopToken,
+          cwd,
+          taskDir,
+          ralphPath,
+          renderedPrompt: prompt,
+        });
+        logRunnerEvent(taskDir, {
+          type: "starting_prompt.written",
+          timestamp: new Date().toISOString(),
+          iteration: i,
+          loopToken,
+          path: startingPromptPath,
+        });
+        emitActivity({
+          type: "starting_prompt.written",
+          iteration: i,
+          maxIterations: currentMaxIterations,
+          loopToken,
+          level: "info",
+          path: startingPromptPath,
+          message: `Iteration ${i}/${currentMaxIterations}: starting prompt saved to ${displayRunnerPath(cwd, startingPromptPath)}`,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        onNotify?.(`Failed to write starting prompt for iteration ${i}: ${message}`, "warning");
+      }
       const writeIterationTranscriptSafe = (record: IterationRecord, assistantText?: string, note?: string) => {
         try {
-          writeIterationTranscript(taskDir, { record, prompt, commandOutputs: commandsOutput, assistantText, note });
+          const transcriptPath = writeIterationTranscript(taskDir, { record, prompt, commandOutputs: commandsOutput, assistantText, note });
+          emitActivity({
+            type: "transcript.written",
+            iteration: record.iteration,
+            maxIterations: currentMaxIterations,
+            loopToken,
+            level: "info",
+            path: transcriptPath,
+            message: `Iteration ${record.iteration}: transcript saved to ${displayRunnerPath(cwd, transcriptPath)}`,
+          });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           onNotify?.(`Failed to write iteration transcript for iteration ${record.iteration}: ${message}`, "warning");
@@ -725,13 +856,59 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       };
 
       // Run RPC iteration
-      onNotify?.(`Iteration ${i}/${currentMaxIterations} starting`, "info");
+      emitActivity({
+        type: "agent.activity",
+        iteration: i,
+        maxIterations: currentMaxIterations,
+        loopToken,
+        level: "info",
+        message: `Iteration ${i}/${currentMaxIterations}: agent starting with exported context`,
+      });
 
       const cancelPollInterval = setInterval(() => {
         if (checkCancelSignal(taskDir)) {
           iterationAbortController.abort();
         }
       }, 500);
+      let lastMessageUpdateNotifyMs = 0;
+      let lastLiveChangedFilesKey = "";
+      let liveFilePollBusy = false;
+      const emitWorkspaceFilesChanged = (changedFiles: string[]) => {
+        if (changedFiles.length === 0) return;
+        const key = changedFileKey(changedFiles);
+        if (key === lastLiveChangedFilesKey) return;
+        lastLiveChangedFilesKey = key;
+        const timestamp = new Date().toISOString();
+        logRunnerEvent(taskDir, {
+          type: "workspace.files.changed",
+          timestamp,
+          iteration: i,
+          loopToken,
+          changedFiles,
+        });
+        emitActivity({
+          type: "workspace.files.changed",
+          timestamp,
+          iteration: i,
+          maxIterations: currentMaxIterations,
+          loopToken,
+          level: "info",
+          changedFiles,
+          message: `Iteration ${i}/${currentMaxIterations}: files changed: ${summarizeChangedFiles(changedFiles)}`,
+        });
+      };
+      const liveFilePollInterval = setInterval(() => {
+        if (liveFilePollBusy) return;
+        liveFilePollBusy = true;
+        try {
+          const currentSnapshot = captureTaskDirectorySnapshot(ralphPath);
+          emitWorkspaceFilesChanged(diffTaskDirectorySnapshots(snapshotBefore, currentSnapshot));
+        } catch {
+          // Live polling is observational; final progress detection remains authoritative.
+        } finally {
+          liveFilePollBusy = false;
+        }
+      }, LIVE_FILE_POLL_INTERVAL_MS);
 
       let rpcResult: RpcSubprocessResult;
       try {
@@ -755,9 +932,90 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
           modelId: config.modelId,
           thinkingLevel: config.thinkingLevel,
           signal: iterationAbortController.signal,
+          onEvent(event) {
+            const timestamp = new Date().toISOString();
+            if (event.type === "agent_start") {
+              logRunnerEvent(taskDir, {
+                type: "agent.started",
+                timestamp,
+                iteration: i,
+                loopToken,
+              });
+              emitActivity({
+                type: "agent.started",
+                timestamp,
+                iteration: i,
+                maxIterations: currentMaxIterations,
+                loopToken,
+                level: "info",
+                message: `Iteration ${i}/${currentMaxIterations}: agent started`,
+              });
+              return;
+            }
+
+            const textDelta = extractAgentTextDelta(event);
+            if (textDelta !== undefined && textDelta.trim().length > 0) {
+              const bounded = truncateActivityText(textDelta);
+              logRunnerEvent(taskDir, {
+                type: "agent.message_update",
+                timestamp,
+                iteration: i,
+                loopToken,
+                textDelta: bounded.text,
+                ...(bounded.truncated ? { textTruncated: true } : {}),
+              });
+              const nowMs = Date.now();
+              if (nowMs - lastMessageUpdateNotifyMs >= AGENT_MESSAGE_UPDATE_NOTIFY_INTERVAL_MS) {
+                lastMessageUpdateNotifyMs = nowMs;
+                emitActivity({
+                  type: "agent.message_update",
+                  timestamp,
+                  iteration: i,
+                  maxIterations: currentMaxIterations,
+                  loopToken,
+                  level: "info",
+                  textDelta: bounded.text,
+                  message: `Iteration ${i}/${currentMaxIterations}: agent says: ${bounded.text}`,
+                });
+              }
+              return;
+            }
+
+            if (event.type === "agent_end") {
+              emitActivity({
+                type: "agent.ended",
+                timestamp,
+                iteration: i,
+                maxIterations: currentMaxIterations,
+                loopToken,
+                level: "info",
+                message: `Iteration ${i}/${currentMaxIterations}: agent finished`,
+              });
+              return;
+            }
+
+            if (event.type.startsWith("tool_") || event.type === "tool_call") {
+              const toolName = typeof event.toolName === "string" ? ` ${event.toolName}` : "";
+              emitActivity({
+                type: "agent.activity",
+                timestamp,
+                iteration: i,
+                maxIterations: currentMaxIterations,
+                loopToken,
+                level: "info",
+                message: `Iteration ${i}/${currentMaxIterations}: ${event.type}${toolName}`,
+              });
+            }
+          },
         });
       } finally {
         clearInterval(cancelPollInterval);
+        clearInterval(liveFilePollInterval);
+      }
+      try {
+        emitWorkspaceFilesChanged(diffTaskDirectorySnapshots(snapshotBefore, captureTaskDirectorySnapshot(ralphPath)));
+      } catch {
+        // Final progress detection below reports any authoritative snapshot issues.
       }
 
       let iterEndMs = Date.now();
@@ -1182,6 +1440,15 @@ export async function runRalphLoop(config: RunnerConfig): Promise<RunnerResult> 
       guardrails: currentGuardrails,
     };
     writeStatusFile(taskDir, finalStatusFile);
+    emitActivity({
+      type: "status.written",
+      iteration: finalStatusFile.currentIteration || undefined,
+      maxIterations: currentMaxIterations,
+      loopToken,
+      level: finalStatus === "error" || finalStatus === "timeout" || finalStatus === "cancelled" ? "warning" : "info",
+      message: `Status updated: ${finalStatus}`,
+      path: join(taskDir, ".ralph-runner", "status.json"),
+    });
     syncActiveLoopRegistry(finalStatusFile);
     logRunnerEvent(taskDir, {
       type: "runner.finished",
